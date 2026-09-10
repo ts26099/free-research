@@ -63,8 +63,18 @@ PR_VMAX      = 5.0       # PR 속도 성분 정규화 기준
 PR_WD, PR_WV = 0.6, 0.4  # PR 내부 가중치 (거리 : 접근속도). 검증 전 초기 가설
 W_SC, W_PR   = 0.5, 0.5  # DPI 합성 가중치. 선험적 근거가 없으므로 동일하게 둔다
 
-W_LANE       = 2.0       # PA 길목: 패스선에서 이만큼 떨어져야 완전히 열린 것으로 본다 (m)
-PA_SPACE_R   = 5.0       # PA 수신공간: 마크와 이만큼 떨어지면 만점 (m)
+W_LANE       = 3.0       # PA 길목: 패스선에서 이만큼 떨어져야 완전히 열린 것으로 본다 (m)
+                         #   기준은 '공이 지나가는 동안 수비수가 닿을 수 있는 폭'이다.
+                         #   15 m 패스가 12~15 m/s 로 날아가면 1.0~1.2초가 걸리고, 그 사이
+                         #   수비수는 옆으로 두어 걸음(2 m 남짓) 움직이고 팔다리로 1 m 를
+                         #   더 덮는다. 기존 2.0 m 는 이 값보다 좁아서 길목이 너무 쉽게
+                         #   '완전히 열림'이 됐다 (모사 경기에서 51% 가 만점으로 포화).
+PA_SPACE_R   = 8.0       # PA 수신공간: 마크와 이만큼 떨어지면 만점 (m)
+                         #   같은 논리다. 5 m 는 '수비수가 볼 도착 전에 좁히고 들어올 수
+                         #   있는 거리'라 자유롭다고 볼 수 없는데도 만점을 줬고, 그 결과
+                         #   86% 의 행이 1.0 으로 포화돼 이 차원이 사실상 아무 정보도
+                         #   나르지 못했다 (표준편차 0.16). 포화율은 아래 [지표 진단]에
+                         #   매번 찍히므로 실제 데이터로 다시 조정할 것.
 PA_PI_MIN    = 0.3       # PA 전진가치 하한 (후방 패스도 0은 아니다)
 PA_FWD_REF   = 30.0      # 전진 이득 정규화 기준 (m)
 PA_LEARN     = True      # 실제 패스에서 지수 a,b,c 를 학습할지. False 면 전부 1 (= l*phi*pi)
@@ -659,8 +669,17 @@ def calculate_pr(tracks, F, delta=DELTA, fps=None):
             "kinematics_ok": (~bad).values})[had.values])
 
     r = pd.concat(parts, ignore_index=True)
-    r["PD"] = np.clip(1 - r.d / PR_R, 0, 1) ** 2
-    r["PV"] = np.clip(r.v_app / PR_VMAX, 0, 1).where(r.kinematics_ok) + 0.0
+    # 거리 커널. PD 는 이것의 제곱이고, 속도 성분에도 같은 커널을 곱한다.
+    #   원래 PV = clip(v_app/PR_VMAX, 0, 1) 에는 거리가 전혀 안 들어갔다. 그래서
+    #   공에서 40 m 떨어진 수비수가 공 쪽으로 5 m/s 로 달리기만 해도 PV=1 -> PR=0.4 가
+    #   나왔고, 이는 볼 소유자에게 1 m 까지 붙어 자리를 지킨 수비수(PR=0.486)와
+    #   거의 같은 값이다. 모사 경기에서 재 보니 25 m 밖에서 쌓인 값이 PR 총량의
+    #   50% 였고, 선언한 가중치 60:40 과 달리 실제 기여는 거리 18 : 속도 82 였다.
+    #   먼 거리에서의 복귀 주력은 '압박'이 아니라 활동량이므로 PR 에 들어오면 안 된다.
+    #   PR_R 을 그대로 쓰므로 새로 정할 상수는 없다.
+    prox = np.clip(1 - r.d / PR_R, 0, 1)
+    r["PD"] = prox ** 2
+    r["PV"] = (np.clip(r.v_app / PR_VMAX, 0, 1) * prox).where(r.kinematics_ok) + 0.0
     r["PR"] = PR_WD * r.PD + PR_WV * r.PV
     return r.sort_values(["frame", "track_id"]).reset_index(drop=True)
 
@@ -714,13 +733,18 @@ def calculate_sc(tracks, F, teams):
             continue
         w = danger_weight(grid, goals[def_t], (m.ball_x, m.ball_y), area)
         sc, tot = sc_shapley(grid, dfd[["X", "Y"]].to_numpy(float), att, w)
+        # SC 는 '위험도 가중 면적'이라 프레임마다 파이의 크기 자체가 다르다.
+        # (공이 자기 박스 안이면 총량 320, 상대 박스면 29 로 11배 차이)
+        # 그래서 프레임끼리 비교하려면 팀 총량 대비 몫도 같이 본다. 효율성 공리
+        # 덕분에 한 프레임의 share 합은 정확히 1 이다.
         rows.append(pd.DataFrame({"frame": fr, "track_id": dfd.track_id.to_numpy(),
-                                  "SC": sc, "sc_team_total": tot}))
+                                  "SC": sc, "sc_team_total": tot,
+                                  "SC_share": sc / tot if tot > 0 else 0.0}))
         n += 1
         if n % 500 == 0:
             print(f"    {n}/{len(frames)} 프레임 ... {(time.perf_counter()-t0)/n*1000:.1f} ms/프레임")
     if not rows:
-        return pd.DataFrame(columns=["frame", "track_id", "SC", "sc_team_total"])
+        return pd.DataFrame(columns=["frame", "track_id", "SC", "sc_team_total", "SC_share"])
     print(f"    {n} 프레임 완료, {(time.perf_counter()-t0)/max(n,1)*1000:.1f} ms/프레임")
     return pd.concat(rows, ignore_index=True)
 
@@ -905,6 +929,51 @@ def learn_pa_exponents(pa_df, passes):
                   f"(개선 {gain:+.3f} > 순열검정 문턱 {thr:+.3f}) 채택")
 
 
+# ══════════════ 5c. 지표 진단 ══════════════
+def metric_report(M, PAdf, agg):
+    """
+    값이 '상대적으로 말이 되는 범위'에 있는지 매 실행마다 확인한다.
+
+    지표가 틀리는 방식은 두 가지다.
+      (1) 바닥 효과 — 대부분의 행에서 0 이라 사실상 '몇 번 관여했나'만 재게 된다.
+      (2) 포화     — 대부분의 행에서 1 이라 그 차원이 아무 정보도 나르지 못한다.
+    둘 다 평균값만 보면 안 보이고, 분포를 봐야 드러난다. 상수를 바꿀 근거도
+    여기서 나온다.
+    """
+    print("\n[지표 진단]  각 성분이 실제로 정보를 나르고 있는지")
+    pr = M[M.PR.notna()] if "PR" in M.columns else M.iloc[:0]
+    if len(pr):
+        inz = (pr.d <= PR_R).mean()
+        cPD, cPV = PR_WD * pr.PD.mean(), PR_WV * pr.PV.mean()
+        tot = cPD + cPV
+        print(f"  PR  압박권(d<={PR_R:.0f}m) 안 {inz*100:4.1f}% / "
+              f"공까지 거리 중앙값 {pr.d.median():.1f} m")
+        if tot > 0:
+            print(f"      실제 기여 거리항 {cPD/tot*100:4.1f}% : 속도항 {cPV/tot*100:4.1f}% "
+                  f"(선언한 가중치 {PR_WD*100:.0f}:{PR_WV*100:.0f})")
+        far = pr[pr.d > 25]
+        if pr.PR.sum() > 0:
+            print(f"      25m 밖에서 쌓인 몫 {far.PR.sum()/pr.PR.sum()*100:4.1f}% "
+                  f"— 여기가 크면 압박이 아니라 활동량을 재고 있는 것이다")
+    if len(PAdf):
+        for c in ("PA_lane", "PA_space", "PA_prog"):
+            s = PAdf[c]
+            print(f"  {c:9s} 평균 {s.mean():.3f} 표준편차 {s.std():.3f} / "
+                  f"1.0 포화 {(s >= 0.999).mean()*100:4.1f}% , 0.0 바닥 {(s <= 0.001).mean()*100:4.1f}%")
+        print(f"      포화가 절반을 넘으면 그 차원은 순위에 기여하지 못한다 "
+              f"(W_LANE={W_LANE}, PA_SPACE_R={PA_SPACE_R} 를 키울 것)")
+    # 지표가 '어디에 서는 선수인가'로 얼마나 설명되는지
+    if len(agg) > 3 and "d_mean" in agg.columns:
+        from scipy.stats import spearmanr as _sp
+        for c in ("SC_mean", "PR_mean", "PA_mean"):
+            s = agg[c].dropna()
+            d = agg["d_mean"].reindex(s.index)
+            ok = s.notna() & d.notna()
+            if ok.sum() > 3:
+                print(f"  {c:8s} vs 공까지 평균거리 ρ={_sp(s[ok], d[ok]).statistic:+.3f}", end="")
+        print("\n      |ρ| 가 1 에 가까우면 그 지표는 능력이 아니라 포지션을 재고 있다")
+
+
 # ══════════════ 6. 자체 검증 ══════════════
 def self_test():
     print("\n[검증] 계산이 정의대로 되는지 확인")
@@ -932,12 +1001,32 @@ def self_test():
     c6 = danger_weight(np.array([[85., 10.]]), (0, 34), (33, 34), 1)[0] < \
          danger_weight(np.array([[24., 34.]]), (0, 34), (33, 34), 1)[0]
 
+    # PR: 멀리서 공 쪽으로 달리기만 하는 수비수가 압박으로 잡히면 안 된다.
+    #   붙어서 자리를 지킨 수비수(1 m, 정지) vs 30 m 밖에서 5 m/s 로 달려오는 수비수.
+    old, FPS = FPS, fps
+    fr = np.arange(20)
+    tk = [{"frame": f, "time_s": f/fps, "track_id": "A0", "team": "A", "X": 50.0, "Y": 34.0}
+          for f in fr]
+    tk += [{"frame": f, "time_s": f/fps, "track_id": "B_near", "team": "B", "X": 51.0, "Y": 34.0}
+           for f in fr]
+    tk += [{"frame": f, "time_s": f/fps, "track_id": "B_far", "team": "B",
+            "X": 20.0 + 5.0*f/fps, "Y": 34.0} for f in fr]
+    Ft = pd.DataFrame({"frame": fr, "ball_x": 50.0, "ball_y": 34.0,
+                       "poss_team": "A", "poss_id": "A0", "phase": "settled"})
+    pr = calculate_pr(pd.DataFrame(tk), Ft)
+    FPS = old
+    mid = pr[(pr.frame >= 8) & (pr.frame <= 11)]
+    near = mid[mid.track_id == "B_near"].PR.mean()
+    far = mid[mid.track_id == "B_far"].PR.mean()
+    c7 = (far < 0.02) and (near > 5 * max(far, 1e-9))
+
     for nm, c in [("등속 5.00 m/s 정확", c1), ("추적 끊김 구간 NaN", c2),
                   ("team 열 통과", c3), (f"효율성 공리 (오차 {abs(sc.sum()-tot):.0e})", c4),
                   (f"협력 수비 보존 ({s2[0]:.0f} vs {s2[1]:.0f})", c5),
-                  ("위험도 가중치 방향", c6)]:
+                  ("위험도 가중치 방향", c6),
+                  (f"먼 거리 복귀주력은 압박 아님 (근접 {near:.3f} vs 원거리 {far:.3f})", c7)]:
         print(f"  {'PASS' if c else '**FAIL**':9s} {nm}")
-    if not all([c1, c2, c3, c4, c5, c6]):
+    if not all([c1, c2, c3, c4, c5, c6, c7]):
         raise SystemExit("검증 실패. 아래 결과를 믿으면 안 된다.")
 
 
@@ -993,8 +1082,9 @@ def main():
         chk = SCdf.groupby("frame").agg(s=("SC", "sum"), t=("sc_team_total", "first"))
         print(f"  검산    효율성 공리 최대오차 {np.abs(chk.s - chk.t).max():.1e}")
 
-    M = PRdf.merge(SCdf[["frame", "track_id", "SC"]], on=["frame", "track_id"], how="left") \
-        if len(SCdf) else PRdf.assign(SC=np.nan)
+    M = PRdf.merge(SCdf[["frame", "track_id", "SC", "SC_share"]],
+                   on=["frame", "track_id"], how="left") \
+        if len(SCdf) else PRdf.assign(SC=np.nan, SC_share=np.nan)
     # PR/SC 는 수비 중인 선수, PA 는 공격 중인 선수라 서로 다른 프레임에서 나온다.
     # 그래서 행을 합치지 않고 바깥조인으로 이어 붙인다.
     pa_cols = ["frame", "track_id", "team", "PA", "PA_lane", "PA_space", "PA_prog"]
@@ -1005,11 +1095,23 @@ def main():
     agg = (M.groupby("track_id")
              .agg(team=("team", "first"), frames=("frame", "size"),
                   PR_mean=("PR", "mean"), PD_mean=("PD", "mean"), PV_mean=("PV", "mean"),
-                  SC_mean=("SC", "mean"), SC_total=("SC", "sum"), d_mean=("d", "mean"),
+                  SC_mean=("SC", "mean"), SC_total=("SC", "sum"),
+                  SC_share=("SC_share", "mean"), d_mean=("d", "mean"),
                   PA_mean=("PA", "mean"), PA_frames=("PA", "count"),
                   PA_lane=("PA_lane", "mean"), PA_space=("PA_space", "mean"),
                   PA_prog=("PA_prog", "mean"))
              .round(4))
+
+    # PR_mean 하나에는 '얼마나 자주 압박 상황에 있었나'(양)와 '그때 얼마나
+    # 좋았나'(질)가 섞여 있다. 수비형 미드필더는 양이 많아서, 센터백은 양이
+    # 없어서 값이 갈리는데 둘 다 PR_mean 한 숫자로만 보면 구분이 안 된다.
+    prm = M[M.PR.notna()] if "PR" in M.columns else M.iloc[:0]
+    if len(prm):
+        agg["PR_zone"] = (prm.assign(_z=prm.d <= PR_R)
+                          .groupby("track_id")["_z"].mean().round(4))     # 관여율
+        agg["PR_in"] = (prm[prm.d <= PR_R].groupby("track_id")["PR"]
+                        .mean().round(4))                                 # 관여했을 때의 질
+    metric_report(M, PAdf, agg)
     for c in ["PR_mean", "SC_mean", "PA_mean"]:
         if c in agg.columns:
             sd = agg[c].std(ddof=0)
