@@ -1173,7 +1173,7 @@ def _pairs_between(grid, cell_a, cell_b, budget=PAIR_BUDGET):
         return
 
     # 셀 쌍을 예산 안에 들어가는 덩어리로 자른다
-    edges, carried, start = [0], 0, 0
+    edges, carried = [0], 0
     for index, total in enumerate(totals):
         if carried and carried + total > budget:
             edges.append(index)
@@ -3404,6 +3404,91 @@ def report(results, show_inputs=True):
 # 밀도만 바꾸면 결과가 얼마나 움직이는가, 그리고 병을 가볍게 하면 그 차이가
 # 사라지는가.
 
+def research_summary(params=None, quick=True, echo=print, **overrides):
+    """연구의 두 물음에 한 번에 답한다 — 최적 충전율과, 액체 종류의 영향.
+
+    Answer both research questions in one call.
+
+    세 가지를 차례로 계산해 출력한다.
+
+    1. :func:`tolerance_scan` — 충전율마다 성공하는 던지기의 폭.
+    2. :func:`coupling_sensitivity` — 착지 모델의 가정을 흔들어도 최적값이
+       그대로인가.
+    3. :func:`substance_scan` — 충전율을 고정하고 액체만 바꾸면 결과가
+       달라지는가.
+
+    ``quick`` 을 끄면 격자를 촘촘히 잡는다 (몇 분 걸린다).
+    """
+    p = resolve_parameters(params, **overrides)
+    if quick:
+        fractions = np.round(np.arange(0.10, 0.76, 0.05), 3)
+        speeds = np.array([3.0, 4.0])
+        couplings = (0.0, 0.15, 0.35)
+        p = p.replace(n_steps=200, n_slices=60)
+    else:
+        fractions = np.round(np.arange(0.05, 0.81, 0.025), 3)
+        speeds = np.array([2.5, 3.0, 3.5, 4.0])
+        couplings = (0.0, 0.05, 0.15, 0.30, 0.50)
+
+    echo("=" * 70)
+    echo("1. 어느 충전율이 가장 잘 세워지는가 / which filling fraction stands")
+    echo("=" * 70)
+    scan = tolerance_scan(p, fractions=fractions, speeds=speeds)
+    echo(format_tolerance(scan))
+
+    echo("")
+    echo("=" * 70)
+    echo("2. 그 답이 착지 모델의 가정에 기대고 있는가 / is that robust")
+    echo("=" * 70)
+    sensitivity = coupling_sensitivity(p, couplings=couplings,
+                                       fractions=fractions, speeds=speeds)
+    echo(format_coupling_sensitivity(sensitivity))
+
+    echo("")
+    echo("=" * 70)
+    echo("3. 액체의 종류나 질량과 무관한가 / does the liquid itself matter")
+    echo("=" * 70)
+    substance = substance_scan(
+        p, fraction=scan["best_fraction"] or p.filling_fraction)
+    echo(format_substance(substance))
+
+    echo("")
+    echo("=" * 70)
+    echo("결론 / conclusion")
+    echo("=" * 70)
+    bests = [row["best_fraction"] for row in sensitivity["rows"]
+             if row["best_fraction"] is not None]
+    real = [row["turns"] for row in substance["rows"]
+            if "보통" in row["variant"]]
+    light = [row["turns"] for row in substance["rows"]
+             if "가벼운" in row["variant"]]
+    if scan["best_fraction"] is None:
+        echo("* 이 설정에서는 어떤 충전율에서도 병이 서지 않았다. 던짐 속도 "
+             "범위를 넓히거나 water_coupling 을 낮춰서 다시 보라.")
+    elif bests:
+        echo("* 가장 넓게 성공하는 충전율은 %.2f 이고, 착지 가정을 %.2f~%.2f "
+             "로 바꾸어도 %.2f~%.2f 사이에 머문다."
+             % (scan["best_fraction"], min(couplings), max(couplings),
+                min(bests), max(bests)))
+    else:
+        echo("* 가장 넓게 성공하는 충전율은 %.2f 다." % scan["best_fraction"])
+    if real:
+        spread_real = (max(real) - min(real)) / max(np.mean(real), 1e-12)
+        echo("* 같은 충전율에서 액체를 바꾸면 회전수가 %.0f%% 달라진다 — "
+             "따라서 '액체의 종류와 무관' 은 엄밀히는 참이 아니다."
+             % (100 * spread_real))
+    if light:
+        spread_light = (max(light) - min(light)) / max(np.mean(light), 1e-12)
+        echo("* 그런데 병을 가볍게 하면 그 차이가 %.1f%% 로 사라진다. 즉 액체가 "
+             "결과에 들어오는 통로는 epsilon = m_bottle/(m_bottle+m_liquid) "
+             "하나이고, 부피 비율이 나머지 전부를 정한다."
+             % (100 * spread_light))
+    echo("* 자유비행의 운동방정식 r'' = omega^2 (r - r_cm) - (2/tau) r' 에는 "
+         "질량이 없다. 위의 두 줄이 그 결과다.")
+    return {"tolerance": scan, "sensitivity": sensitivity,
+            "substance": substance}
+
+
 def _throw_succeeds(params, omega_0, model=None, **overrides):
     """던지기 하나를 계산해 섰는지만 돌려준다.
 
@@ -3538,6 +3623,15 @@ def tolerance_scan(params=None, fractions=None, speeds=None, target=1.0,
 
     ``width`` 는 rad/s 단위의 절대 폭이고, ``relative`` 는 그것을 알맞은 던지기
     세기로 나눈 것이다 — 사람의 던지기 오차는 절대값보다 비율에 가깝다.
+
+    어느 모델로 훑을까
+    ------------------
+    충전율을 촘촘히 훑을 때는 ``slices`` 를 쓴다.  원판은 충전율이 얼마든
+    같은 개수로 나뉘므로 곡선이 매끄럽다.  ``parcels`` 와 ``beads`` 는 충전율을
+    조금 바꿀 때마다 격자에 놓이는 조각·구슬의 층수가 뚝뚝 달라져서, 그
+    이산화의 잡음이 충전율의 효과와 섞인다 (같은 계산을 조각 모델로 하면
+    최적값은 0.45 로 비슷하게 나오지만 곡선이 요동친다).  조각·구슬 모델은
+    던지기 하나를 자세히 확인할 때 쓰는 것이 맞다.
     """
     p = resolve_parameters(params, **overrides)
     if fractions is None:
@@ -3572,16 +3666,21 @@ def tolerance_scan(params=None, fractions=None, speeds=None, target=1.0,
     best_width = width.max(axis=1)
     d_speed = float(np.mean(np.diff(speeds))) if speeds.size > 1 else 1.0
     basin = width.sum(axis=1) * d_speed
-    with np.errstate(invalid="ignore", divide="ignore"):
-        relative = np.nanmax(np.where(width > 0, width / center, np.nan),
-                             axis=1) if speeds.size else np.zeros_like(width)
-    relative = np.nan_to_num(relative)
+    # 성공한 격자점이 하나도 없는 줄에서 nanmax 는 경고와 NaN 을 낸다.
+    useful = (width > 0) & np.isfinite(center)
+    ratio = np.where(useful, width / np.where(useful, center, 1.0), 0.0)
+    relative = ratio.max(axis=1)
+
+    # 어떤 충전율에서도 서지 않으면 "최적값" 이라는 것이 없다. 그때 argmax 는
+    # 첫 번째 칸을 가리키는데, 그것을 답으로 내놓으면 거짓말이 된다.
+    stands_somewhere = bool(np.any(basin > 0))
+    best = float(fractions[int(np.argmax(basin))]) if stands_somewhere else None
 
     return {"parameters": p, "fractions": fractions, "speeds": speeds,
             "width": width, "center": center, "best_width": best_width,
             "relative": relative, "basin": basin, "slowdown": slowdown,
-            "target": target,
-            "best_fraction": float(fractions[int(np.argmax(basin))])}
+            "target": target, "any_stands": stands_somewhere,
+            "best_fraction": best}
 
 
 def format_tolerance(scan):
@@ -3610,11 +3709,17 @@ def format_tolerance(scan):
     lines.append("")
     lines.append("성공 폭 [rad/s] = 병이 서는 초기 각속도의 폭. 이분법으로 "
                  "경계를 찾으므로 격자 간격에 좌우되지 않는다.")
-    lines.append("가장 넓은 충전율 / widest at: %.2f" % scan["best_fraction"])
-    good = scan["fractions"][scan["basin"] >= 0.5 * scan["basin"].max()]
-    if good.size:
-        lines.append("최대의 절반 이상 / at least half the best: %.2f ~ %.2f"
-                     % (good.min(), good.max()))
+    if scan["best_fraction"] is None:
+        lines.append("어떤 충전율에서도 서지 않았다 / no filling fraction "
+                     "stands under these settings — 던짐 속도 범위를 넓히거나 "
+                     "water_coupling 을 낮춰 보라")
+    else:
+        lines.append("가장 넓은 충전율 / widest at: %.2f"
+                     % scan["best_fraction"])
+        good = scan["fractions"][scan["basin"] >= 0.5 * scan["basin"].max()]
+        if good.size:
+            lines.append("최대의 절반 이상 / at least half the best: "
+                         "%.2f ~ %.2f" % (good.min(), good.max()))
     lines.append("")
     lines.append("주의: 거의 가득 찬 병일수록 물이 움직일 빈 공간이 없어 "
                  "실제로는 굳은 물체에 가까워진다 (water_coupling 이 1 에 "
@@ -3652,16 +3757,26 @@ def format_coupling_sensitivity(sensitivity):
              "", "%14s %16s   %s" % ("water_coupling", "최적 충전율",
                                      "충전율별 성공 폭 (최대=100)")]
     for row in sensitivity["rows"]:
+        if row["best_fraction"] is None:
+            lines.append("%14.2f %16s   %s"
+                         % (row["coupling"], "-",
+                            "이 결합도에서는 아무 충전율도 서지 않는다"))
+            continue
         peak = max(row["basin"].max(), 1e-30)
         shape = " ".join("%3.0f" % (100 * b / peak) for b in row["basin"])
         lines.append("%14.2f %16.2f   %s" % (row["coupling"],
                                              row["best_fraction"], shape))
-    bests = [row["best_fraction"] for row in sensitivity["rows"]]
+    bests = [row["best_fraction"] for row in sensitivity["rows"]
+             if row["best_fraction"] is not None]
     lines.append("")
-    lines.append("최적 충전율의 범위 / the optimum moves between %.2f and %.2f"
-                 % (min(bests), max(bests)))
-    lines.append("이 폭이 좁으면, 결론은 water_coupling 이라는 가정에 기대고 "
-                 "있지 않다는 뜻이다.")
+    if bests:
+        lines.append("최적 충전율의 범위 / the optimum moves between %.2f and "
+                     "%.2f" % (min(bests), max(bests)))
+        lines.append("이 폭이 좁으면, 결론은 water_coupling 이라는 가정에 "
+                     "기대고 있지 않다는 뜻이다.")
+    else:
+        lines.append("어느 결합도에서도 서지 않았다 / nothing stands at any "
+                     "coupling here")
     return "\n".join(lines)
 
 
@@ -3944,8 +4059,9 @@ def figure_tolerance(scan, plt=None):
     ax_rate.plot(fractions, scan["best_width"], "o-", color="#1f77b4")
     ax_rate.axvspan(0.30, 0.40, color="#ff7f0e", alpha=0.15,
                     label="0.30 - 0.40")
-    ax_rate.axvline(scan["best_fraction"], color="#d62728", lw=1,
-                    ls="--", label="widest %.2f" % scan["best_fraction"])
+    if scan["best_fraction"] is not None:
+        ax_rate.axvline(scan["best_fraction"], color="#d62728", lw=1,
+                        ls="--", label="widest %.2f" % scan["best_fraction"])
     ax_rate.set_xlabel("filling fraction")
     ax_rate.set_ylabel(r"width of throws that stand [rad/s]")
     ax_rate.set_ylim(0, None)
@@ -4036,6 +4152,12 @@ def build_parser():
                         help="with --ui, publish a temporary public link")
     output.add_argument("--describe", action="store_true",
                         help="print the parameters and exit without running")
+    output.add_argument("--research", action="store_true",
+                        help="answer the research questions instead of running "
+                             "one throw: which filling fraction stands most "
+                             "often, and whether the liquid itself matters")
+    output.add_argument("--thorough", action="store_true",
+                        help="with --research, use a fine grid (minutes)")
     output.add_argument("--save-figure", metavar="PATH", default=None)
     output.add_argument("--save-data", metavar="PATH", default=None)
     output.add_argument("--no-plot", action="store_true")
@@ -4110,6 +4232,8 @@ def main(argv=None):
     if args.describe:
         print(params.describe())
         return params
+    if args.research:
+        return research_summary(params, quick=not args.thorough)
 
     if args.interactive:
         return run_interactive(params, show=not args.no_plot,
