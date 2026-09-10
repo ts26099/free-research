@@ -1355,8 +1355,10 @@ def total_contribution(agg, tracks, teams):
         a["dist_own_goal"] = dist_goal.reindex(a.index).round(1)
     a["is_gk"] = a.index.isin(gks)
 
-    seen = a.get("frames", pd.Series(0, index=a.index)).fillna(0) \
-           + a.get("PA_frames", pd.Series(0, index=a.index)).fillna(0)
+    # frames 는 이미 '이 선수가 등장한 전체 행 수'(수비 행 + 공격 행)다.
+    # 여기에 PA_frames 를 더하면 공격 행만 두 번 세게 되고, 점유율이 높은 팀의
+    # 선수가 표본이 더 많은 것처럼 잡힌다.
+    seen = a.get("frames", pd.Series(0, index=a.index)).fillna(0)
     thin = seen < TC_MIN_FRAMES * seen.median()
     use = ~a["is_gk"] & ~thin
 
