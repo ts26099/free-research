@@ -1,6 +1,20 @@
 # =====================================================================
-#  축구 선수 비가시적 기여도 — SC / PR 계산  (단일 셀 버전)
+#  축구 선수 비가시적 기여도 — SC / PR / PA 계산  (단일 셀 버전)
 #  코랩에 통째로 붙여넣고 실행하면 된다. 엑셀(.xlsx) / CSV 둘 다 읽는다.
+#
+#  내는 값
+#    SC  공간 통제   수비 중, 위험한 공간을 얼마나 덮었나 (Shapley 배분)
+#    PR  압박 기여   수비 중, 볼 소유자에게 얼마나 붙고 얼마나 빠르게 좁혔나
+#    PA  패스 유인   공격 중, 얼마나 좋은 패스 선택지였나
+#    DPI 수비 합성 = 0.5·z(SC) + 0.5·z(PR)
+#    TC  총 기여   = 1/3 씩 합친 값 (+ 포지션 보정본 TC_adj)
+#
+#  읽는 순서
+#    1) [검증]      계산이 정의대로 되는지 (9개 항목)
+#    2) [읽기]      좌표 품질 — 여기서 경고가 나오면 아래 숫자는 믿을 게 못 된다
+#    3) [지표 진단] 각 성분이 실제로 정보를 나르고 있는지 (바닥/포화/재현성)
+#    4) [총 기여도] 무엇을 뺐고 가중치에 얼마나 휘둘리는지
+#    5) [선수별 결과]
 # =====================================================================
 
 # ─────────────────── 설정 (여기만 고치면 된다) ───────────────────
@@ -16,10 +30,38 @@ PITCH_L, PITCH_W = 105.0, 68.0     # 경기장 가로(골대~골대), 세로 (m)
                                    #   ★ 반드시 실제 규격으로 바꿀 것. 아래 상수들이 여기 딸려 있다.
 SCALE_TO_PITCH = True              # True 면 '경기장 크기에 비례하는' 상수들을 자동으로 줄인다
 COORD_ORIGIN = "auto"    # "corner" = 왼쪽아래가 (0,0) / "center" = 경기장 중앙이 (0,0) / "auto"
-TEAM_A_ATTACKS_PLUS_X = True       # 첫 번째 팀이 +X 방향으로 공격하는가
+TEAM_A_ATTACKS_PLUS_X = "auto"     # 첫 번째 팀이 +X 방향으로 공격하는가. "auto" / True / False
+                         #   이 값이 틀리면 SC 의 위험도 가중치가 상대 골대 쪽에 걸리고
+                         #   PA 의 전진 부호가 뒤집혀 결과가 통째로 무의미해진다. 그런데
+                         #   기본값 True 는 절반의 확률로 틀리고, 틀려도 아무 신호가 없다.
+                         #   골키퍼는 자기 골대 앞에 상주하므로 '팀별로 가장 낮은 X 에
+                         #   상주하는 선수'를 보면 어느 팀이 x=0 골대를 지키는지 알 수 있다.
+                         #   전반·후반이 한 파일에 같이 있으면 방향이 중간에 바뀌므로
+                         #   그 경우도 검사해서 경고한다.
+
+OUT_OF_PITCH_MARGIN = 3.0          # 경기장 경계에서 이보다 더 밖에 있는 '사람' 행은 버린다 (m)
+                         #   중계 영상에는 선수 말고도 사람이 많다. 첨부 영상 한 프레임에도
+                         #   감독, 대기심, 사진기자, 안전요원(형광 조끼)이 터치라인 밖에
+                         #   줄지어 있다. 검출기는 이들도 person 으로 잡으므로 좌표에
+                         #   섞여 들어오고, 그러면 프레임당 인원이 부풀고 SC 는 터치라인
+                         #   밖 인원에게 공간 점유를 나눠 준다.
+                         #   스로인·코너킥을 차는 선수는 실제로 라인 밖에 서므로 여유를
+                         #   3 m 둔다. 벤치·사진기자석은 이보다 멀다.
+                         #   부심은 터치라인을 따라 달려서 이 방법으로는 안 걸러진다.
+                         #   team 열에서 걸러야 한다(아래 심판 키워드 필터).
+                         #   0 이면 이 필터를 끈다.
+BALL_OUT_MARGIN = 1.0    # 공이 경기장 경계에서 이보다 밖에 있으면 '데드볼'로 본다 (m)
+                         #   90분 경기에서 공이 실제로 살아 있는 시간은 55~60분뿐이다.
+                         #   스로인·골킥을 기다리는 동안에도 지금 코드는 소유팀을 정하고
+                         #   SC·PR·PA 를 계산한다. 그 구간의 선수 배치는 전술적 공간
+                         #   다툼이 아니라 '재개를 기다리는 정렬'이라 지표를 오염시킨다.
+                         #   공 중심 좌표 기준이라 라인 위의 공은 살아 있는 것으로 둔다.
+                         #   0 이면 이 필터를 끈다.
 
 REPAIR_IDS   = "auto"    # 프레임마다 ID 가 뒤바뀌는 데이터를 헝가리안 매칭으로 복구
                          # "auto" = 이상하면 자동 실행 / True / False
+REPAIR_SLACK_M = 2.0     # ID 재연결에서 허용할 좌표 흔들림 여유 (m)
+                         # 연결 상한 = SPEED_MAX × 프레임간격 + 이 값
 
 DELTA        = 3         # 중앙차분 폭 (프레임)
 SPEED_MAX    = 11.0      # 이 속도(m/s) 넘으면 이상치로 버림
@@ -105,6 +147,19 @@ PA_SPACE_R   = 8.0       # PA 수신공간: 마크와 이만큼 떨어지면 만
 PA_PI_MIN    = 0.3       # PA 전진가치 하한 (후방 패스도 0은 아니다)
 PA_FWD_REF   = 30.0      # 전진 이득 정규화 기준 (m)
 PA_LEARN     = True      # 실제 패스에서 지수 a,b,c 를 학습할지. False 면 전부 1 (= l*phi*pi)
+PA_MIN_PASSES = 200      # 지수를 학습하려면 최소 이만큼의 패스가 있어야 한다
+                         #   기존 문턱은 30 이었는데, 지수가 3개인 모형을 30~40 개
+                         #   표본으로 학습하고 그 중 30% 로 AUC 를 재면 검증 자체가
+                         #   잡음이다. 실제로 '패스 상대가 무작위인' 모사 데이터에서
+                         #   패스 44개로 AUC 0.387 -> 0.613 이 나와 순열검정 문턱까지
+                         #   넘고 채택됐다. 존재하지 않는 신호를 학습한 것이다.
+                         #   한 번 채택되면 모든 PA 값이 그 지수로 다시 계산되므로
+                         #   TC 순위까지 잡음이 된다.
+                         #   90분 경기의 팀 패스는 보통 400~700 개라 200 은 무리한
+                         #   요구가 아니고, 그보다 적으면 지수 1 을 유지하는 편이 낫다.
+PA_MIN_TEST_PASSES = 50  # 그 중 검증(hold-out)에 들어갈 패스의 최소 개수
+PASS_MAX_GAP_S = 3.0     # 두 소유 구간 사이가 이보다 벌어지면 한 번의 패스로 안 본다 (초)
+                         # 가장 긴 롱볼도 3초면 도착한다. 0 이면 이 조건을 끈다.
 
 MAX_FRAMES   = None      # 테스트할 때 앞쪽 N 프레임만. 전체면 None
 SAVE_XLSX    = "sc_pr_result.xlsx"
@@ -121,9 +176,10 @@ warnings.filterwarnings("ignore")
 # ── 경기장 크기에 따른 상수 자동 조정 ────────────────────────────────
 #  상수는 두 종류다.
 #    (A) 경기장 크기에 비례하는 것 — 전술적 '지리'에 대한 값이라 작은 구장에서는 같이 줄어야 한다
-#          LAMBDA_GOAL, LAMBDA_BALL, PR_R, PA_FWD_REF
+#          LAMBDA_GOAL, LAMBDA_BALL, PR_R, PA_FWD_REF, GK_MAX_DIST
 #    (B) 비례하지 않는 것 — 사람 몸과 공의 크기·속도라서 구장이 작아져도 그대로다
-#          SPEED_MAX, PR_VMAX, W_LANE, PA_SPACE_R, POSS_RADIUS
+#          SPEED_MAX, PR_VMAX, W_LANE, PA_SPACE_R, POSS_RADIUS,
+#          OUT_OF_PITCH_MARGIN, BALL_OUT_MARGIN, BALL_AIRBORNE_Z, REPAIR_SLACK_M
 #  둘을 같이 줄이면 "작은 구장에서는 사람이 느리게 뛴다"는 말이 되어버린다.
 _FULL_L, _FULL_W = 105.0, 68.0
 PITCH_SCALE = 1.0
@@ -134,6 +190,7 @@ if SCALE_TO_PITCH:
         LAMBDA_BALL *= PITCH_SCALE
         PR_R        *= PITCH_SCALE
         PA_FWD_REF  *= PITCH_SCALE
+        GK_MAX_DIST *= PITCH_SCALE      # 골키퍼 판정 거리도 구장에 딸려 간다
 
 IN_COLAB = "google.colab" in sys.modules
 
@@ -181,6 +238,19 @@ def map_columns(df, verbose=True):
     if verbose and ren:
         print("  열 인식:", ", ".join(f"{v} <- '{k}'" for k, v in ren.items()))
     return df.rename(columns=ren)
+
+
+def looks_centered(x, y):
+    """
+    좌표 원점이 경기장 중앙인지 판정한다.
+
+    구석 원점이면 좌표의 중앙값이 경기장 한가운데(52.5, 34) 근처이고,
+    중앙 원점이면 0 근처다. 최소값으로 판정하면 안 된다 — 스로인을 차려고
+    라인 밖에 선 선수나 터치라인 밖 감독 한 명이면 음수 좌표가 생겨서
+    판정이 뒤집히고, 전체 좌표가 반 경기장만큼 밀린 채로 조용히 계산된다.
+    """
+    return (abs(float(np.median(x))) < PITCH_L * 0.25
+            and abs(float(np.median(y))) < PITCH_W * 0.25)
 
 
 BALL_WORDS = ("ball", "공", "볼")
@@ -243,24 +313,38 @@ def repair_ids(tracks, verbose=True):
         prev_xy = g0[["X", "Y"]].to_numpy(float)
         prev_lbl = [cur[i] for i in g0["track_id"]]
 
+        prev_f = fs[0]
         for f in fs[1:]:
             g = by_f[f]
             xy = g[["X", "Y"]].to_numpy(float)
             n = min(len(prev_xy), len(xy))
             if n == 0:
-                prev_xy, prev_lbl = xy, [f"{team}_x{k}" for k in range(len(xy))]
+                prev_xy, prev_lbl, prev_f = xy, [f"{team}_x{k}" for k in range(len(xy))], f
                 out.loc[g.index, "stable_id"] = prev_lbl
                 continue
             C = np.linalg.norm(prev_xy[:, None, :] - xy[None, :, :], axis=2)
             r, c = linear_sum_assignment(C)
+            # 사람이 그 사이에 갈 수 있는 거리를 넘는 연결은 받지 않는다.
+            #   헝가리안 매칭은 '전체 이동거리 합'만 최소화하므로, 한 명이 화면
+            #   밖으로 나가고 다른 곳에서 다른 사람이 나타나면 40 m 떨어진 둘을
+            #   같은 사람으로 이어 버린다. 그러면 없던 이동거리가 생기고 PR 의
+            #   접근속도가 통째로 오염된다.
+            #   상한을 정확히 SPEED_MAX*dt 로 잡으면 안 된다. 25 fps 에서 그 값은
+            #   0.44 m 인데, 검출 좌표의 흔들림만으로도 이걸 넘는 프레임이 흔해서
+            #   멀쩡한 궤적이 토막난다(실측: 22명이 1980개 ID 로 부서졌다).
+            #   여기서 막으려는 것은 '수십 m 순간이동'이지 정밀한 운동학이 아니므로
+            #   좌표 흔들림 몫을 더해 넉넉히 잡는다. 같은 데이터에서 ID 는 22개로
+            #   복구되고, 40 m 짜리 잘못된 연결은 여전히 거부된다.
+            reach = SPEED_MAX * max(f - prev_f, 1) / FPS + REPAIR_SLACK_M
             lbl = [None] * len(xy)
             for ri, ci in zip(r, c):
-                lbl[ci] = prev_lbl[ri]
+                if C[ri, ci] <= reach:
+                    lbl[ci] = prev_lbl[ri]
             for k in range(len(xy)):                    # 매칭 안 된 행은 새 ID
                 if lbl[k] is None:
                     lbl[k] = f"{team}_new{f}_{k}"
             out.loc[g.index, "stable_id"] = lbl
-            prev_xy, prev_lbl = xy, lbl
+            prev_xy, prev_lbl, prev_f = xy, lbl, f
 
     out["track_id"] = out["stable_id"]
     return out.drop(columns=["stable_id"])
@@ -443,31 +527,104 @@ def read_data():
             "화면 픽셀 좌표로 보인다. 호모그래피로 미터 좌표로 변환한 뒤에 넣어야 한다.\n"
             "픽셀로 계산하면 화면 위/아래의 1m 가 서로 달라져서 결과가 전부 무의미해진다.")
 
-    centered = (COORD_ORIGIN == "center") or (COORD_ORIGIN == "auto" and (xmin < -1 or ymin < -1))
+    # 원점 판정은 looks_centered() 참고. '가장 바깥값'이 아니라 '데이터의 한가운데'로 한다.
+    #   기존 규칙(xmin < -1 이면 중앙 원점)은 음수 좌표 하나만 있어도 뒤집힌다.
+    #   스로인을 차려고 라인 밖에 선 선수, 터치라인 밖의 감독·사진기자가 딱
+    #   그런 값이다. 한 번 잘못 판정하면 전체 좌표가 (+52.5, +34) 만큼 밀려
+    #   모든 결과가 조용히 무의미해진다.
+    #   구석 원점이면 좌표의 중앙값이 경기장 한가운데(52.5, 34) 근처이고,
+    #   중앙 원점이면 0 근처다. 이건 이상치 몇 개로는 안 흔들린다.
+    centered = (COORD_ORIGIN == "center") or \
+               (COORD_ORIGIN == "auto" and looks_centered(tracks.X, tracks.Y))
     if centered:
         for df_ in (tracks, ball):
             df_[["X", "ball_x"][df_ is ball]] += PITCH_L / 2
             df_[["Y", "ball_y"][df_ is ball]] += PITCH_W / 2
         print(f"  좌표계: 중앙 원점으로 판단 -> (+{PITCH_L/2:.1f}, +{PITCH_W/2:.1f}) 평행이동")
+    # ── 경기장 밖 사람 제거 ──────────────────────────────────
+    #  감독·대기심·사진기자·안전요원은 검출기가 person 으로 잡지만 선수가 아니다.
+    #  이들이 좌표에 남으면 프레임당 인원이 부풀고, SC 가 터치라인 밖 인원에게
+    #  공간 점유를 나눠 준다. 스로인을 차는 선수는 실제로 라인 밖에 서므로
+    #  여유(OUT_OF_PITCH_MARGIN)를 두고 그보다 먼 행만 버린다.
+    if OUT_OF_PITCH_MARGIN > 0:
+        m_ = OUT_OF_PITCH_MARGIN
+        inside = (tracks.X.between(-m_, PITCH_L + m_)
+                  & tracks.Y.between(-m_, PITCH_W + m_))
+        if not inside.all():
+            drop_ids = tracks.loc[~inside, "track_id"].value_counts()
+            gone = [i for i, c in drop_ids.items()
+                    if c > 0.5 * (tracks.track_id == i).sum()]
+            print(f"  경기장 밖({m_:.0f} m 초과) {int((~inside).sum()):,}행 제거 "
+                  f"— 대부분이 밖인 id {len(gone)}개는 선수가 아닐 것이다"
+                  + (f": {gone[:8]}{' ...' if len(gone) > 8 else ''}" if gone else ""))
+            tracks = tracks[inside].copy()
+
+    # 규격 판단은 '사람 아닌 것'을 걸러낸 뒤에 한다. 벤치·사진기자석이 섞인 채로
+    # 재면 데이터가 경기장보다 넓게 퍼진 것처럼 보여서, 멀쩡한 규격을 의심하게 된다.
     out_ratio = (~tracks.X.between(0, PITCH_L) | ~tracks.Y.between(0, PITCH_W)).mean()
-    print(f"  좌표 범위 X {tracks.X.min():.1f}~{tracks.X.max():.1f} m , "
-          f"Y {tracks.Y.min():.1f}~{tracks.Y.max():.1f} m  (경기장 밖 {out_ratio*100:.1f}%)")
     sx0 = tracks.X.max() - tracks.X.min()
     sy0 = tracks.Y.max() - tracks.Y.min()
+    print(f"  좌표 범위 X {tracks.X.min():.1f}~{tracks.X.max():.1f} m , "
+          f"Y {tracks.Y.min():.1f}~{tracks.Y.max():.1f} m  (경기장 밖 {out_ratio*100:.1f}%)")
     print(f"  데이터가 실제로 퍼진 범위 {sx0:.0f} x {sy0:.0f} m "
           f"(설정한 경기장 {PITCH_L:.0f} x {PITCH_W:.0f})")
     if out_ratio > 0.05:
-        sx = tracks.X.max() - tracks.X.min()
-        sy = tracks.Y.max() - tracks.Y.min()
         print(f"  ! 경기장 밖 비율이 높다. 설정한 경기장은 {PITCH_L}x{PITCH_W} m 인데 "
-              f"데이터가 실제로 퍼진 범위는 약 {sx:.0f}x{sy:.0f} m 다.")
-        print(f"    7v7 처럼 작은 경기장이면 PITCH_L, PITCH_W 를 실제 규격으로 바꿀 것 "
-              f"(위험도 가중치와 골대 위치가 여기에 달려 있다).")
+              f"데이터가 실제로 퍼진 범위는 약 {sx0:.0f}x{sy0:.0f} m 다.")
+        print(f"    7v7 처럼 작은 경기장이면 PITCH_L, PITCH_W 와 TEAM_SIZE 를 실제 규격으로 "
+              f"바꿀 것 (위험도 가중치와 골대 위치가 여기에 달려 있다).")
 
     if MAX_FRAMES:
         lim = sorted(tracks.frame.unique())[:MAX_FRAMES]
         tracks = tracks[tracks.frame.isin(lim)]
         ball = ball[ball.frame.isin(lim)]
+
+    # ── 공격 방향 ────────────────────────────────────────────
+    #  골키퍼는 자기 골대 앞에 상주하므로, 팀별로 '가장 낮은 X 에 상주하는 선수'를
+    #  비교하면 어느 팀이 x=0 골대를 지키는지 알 수 있다.
+    global TEAM_A_ATTACKS_PLUS_X
+    def _lowest_x(part):
+        lo = {}
+        for t in teams:
+            s = part[part.team == t].groupby("track_id")["X"].mean()
+            lo[t] = float(s.min()) if len(s) else np.nan
+        return lo
+
+    lowest = _lowest_x(tracks)
+    if any(np.isnan(v) for v in lowest.values()):
+        # 한 팀이 통째로 비어 있으면 비교가 NaN 이 되고, NaN 비교는 조용히
+        # False 가 되어 방향을 절반의 확률로 틀리게 잡는다. 그럴 땐 판정하지 않는다.
+        guess = None
+        print("  ! 한 팀의 좌표가 비어 있어 공격 방향을 판정할 수 없다. team 열을 확인할 것.")
+        if TEAM_A_ATTACKS_PLUS_X == "auto":
+            TEAM_A_ATTACKS_PLUS_X = True
+    else:
+        guess = lowest[teams[0]] < lowest[teams[1]]
+    if guess is not None:
+        if TEAM_A_ATTACKS_PLUS_X == "auto":
+            TEAM_A_ATTACKS_PLUS_X = bool(guess)
+            print(f"  공격 방향 자동 판정: {teams[0]} 가 x=0 골대를 지키고 +X 로 공격"
+                  if guess else
+                  f"  공격 방향 자동 판정: {teams[0]} 가 x={PITCH_L:.0f} 골대를 지키고 -X 로 공격")
+            print(f"    (팀별 최소상주 X: {teams[0]} {lowest[teams[0]]:.1f} m , "
+                  f"{teams[1]} {lowest[teams[1]]:.1f} m)")
+        elif bool(TEAM_A_ATTACKS_PLUS_X) != bool(guess):
+            print(f"  ! 설정한 공격 방향(TEAM_A_ATTACKS_PLUS_X={TEAM_A_ATTACKS_PLUS_X})이 "
+                  f"좌표에서 추정한 방향과 반대다.")
+            print(f"    팀별 최소상주 X: {teams[0]} {lowest[teams[0]]:.1f} m , "
+                  f"{teams[1]} {lowest[teams[1]]:.1f} m -> 설정을 다시 확인할 것.")
+    #  전·후반이 한 파일에 있으면 방향이 중간에 바뀐다. 그대로 돌리면 절반이
+    #  반대 골대를 기준으로 계산되므로 반드시 나눠서 돌려야 한다.
+    fr_mid = tracks.frame.median()
+    halves = []
+    for part in (tracks[tracks.frame <= fr_mid], tracks[tracks.frame > fr_mid]):
+        lo = _lowest_x(part) if len(part) else {t: np.nan for t in teams}
+        halves.append(None if any(np.isnan(v) for v in lo.values())
+                      else lo[teams[0]] < lo[teams[1]])
+    if len(halves) == 2 and None not in halves and halves[0] != halves[1]:
+        print("  ! 앞구간과 뒷구간의 공격 방향이 반대다. 전·후반이 한 파일에 들어 있는 것으로 보인다.")
+        print("    이대로 계산하면 절반이 반대 골대를 기준으로 잡혀 SC 와 PA 가 무의미해진다.")
+        print("    전반과 후반을 따로 나눠서 돌릴 것.")
 
     n_per_team = tracks.groupby(["frame", "team"]).size().groupby("team").median()
     if MIN_TRACKED is None:
@@ -478,8 +635,8 @@ def read_data():
           f"(명목 {TEAM_SIZE}명의 80%)")
     cover = float(n_per_team.min()) / TEAM_SIZE
     if cover < 0.9:
-        print(f"  ! 프레임당 추적 인원이 명목 인원의 {cover*100:.0f}% 뿐이다. "
-              f"화면 밖 선수가 빠진 좌표로 보인다.")
+        print(f"  ! 프레임당 추적 인원이 명목 인원({TEAM_SIZE}명)의 {cover*100:.0f}% 뿐이다. "
+              f"화면 밖 선수가 빠졌거나, TEAM_SIZE 가 실제 경기 형식과 다른 것이다.")
         print(f"    이 상태로 SC 를 계산하면 남은 수비수가 빈 자리의 공간 점유까지 "
               f"받아가서 값이 부풀려진다. usable 비율이 낮게 나오는 것이 정상이며, "
               f"경기장 전체를 덮는 좌표를 먼저 확보할 것.")
@@ -499,16 +656,40 @@ def read_data():
               f"(총 이동거리 {v2.sum()/max(v.sum(),1e-9)*100:.0f}%)")
         if v2.quantile(.95) > 15.0:
             print("     ! 복구 후에도 속도가 비현실적이다. 원본 좌표를 다시 확인할 것.")
+        n_id = tracks.track_id.nunique()
+        if n_id > 3 * TEAM_SIZE:
+            print(f"     ! 복구 후 ID 가 {n_id}개다 (선수는 {2*TEAM_SIZE}명). 가림이 생길 때마다"
+                  f" 새 ID 가 붙어 한 선수의 궤적이 조각나 있다는 뜻이다.")
+            print(f"       조각난 ID 로는 '선수별' 표가 선수를 가리키지 않는다. 프레임 단위"
+                  f" 결과(SC/PR/PA 분포)까지만 쓰고, 선수 순위는 믿지 말 것.")
 
     # ── 공 소유 반경 자동 결정 ───────────────────────────────
     mb = tracks.merge(ball, on="frame", how="inner")
+    # 공중볼 구간은 빼고 잰다. 공이 떠 있으면 지면 최근접 거리가 원래 멀어지는데,
+    # 그걸 섞어 재면 '소유 반경'이 실제보다 크게 잡힌다.
+    if "ball_z" in mb.columns:
+        mb = mb[mb["ball_z"].fillna(0) <= BALL_AIRBORNE_Z]
+    if BALL_OUT_MARGIN > 0:                       # 데드볼 구간도 뺀다
+        mo = BALL_OUT_MARGIN
+        mb = mb[mb.ball_x.between(-mo, PITCH_L + mo) & mb.ball_y.between(-mo, PITCH_W + mo)]
     nn = np.hypot(mb.X - mb.ball_x, mb.Y - mb.ball_y).groupby(mb.frame).min()
     if POSS_RADIUS is None:
         for r in (2.0, 3.0, 5.0, 8.0):
             if (nn <= r).mean() >= 0.6:
                 POSS_RADIUS = r
                 break
-        POSS_RADIUS = POSS_RADIUS or float(np.ceil(nn.quantile(0.8)))
+        if POSS_RADIUS is None:
+            # 기존 폴백(80분위 거리)은 상한이 없어서 좌표가 나쁘면 40 m 넘는
+            # '소유 반경'이 나온다. 그러면 경기장 반대편 선수가 볼 소유자로
+            # 잡혀 모든 지표가 말이 안 되는데도 계산은 조용히 끝난다.
+            # 사람이 공을 다룰 수 있는 거리에는 물리적 상한이 있으므로 8 m 에서
+            # 자르고, 대신 데이터 품질 문제라고 알린다.
+            POSS_RADIUS = 8.0
+            print(f"  ! 공에서 8 m 안에 아무도 없는 프레임이 "
+                  f"{(1-(nn<=8.0).mean())*100:.0f}% 다 (공-최근접선수 거리 중앙값 "
+                  f"{nn.median():.1f} m). 공 좌표나 선수 좌표의 정합이 깨진 것이다.")
+            print(f"    POSS_RADIUS 를 8 m 로 자른다. 소유자 판정이 대부분 실패할 것이고,"
+                  f" 그게 정상이다. 좌표 품질을 먼저 고칠 것.")
     cov = (nn <= POSS_RADIUS).mean()
     print(f"  공-최근접선수 거리 중앙값 {nn.median():.1f} m -> POSS_RADIUS = {POSS_RADIUS} m "
           f"(프레임의 {cov*100:.0f}% 에서 소유자 판정 가능)")
@@ -597,6 +778,13 @@ def build_frames_table(tracks, ball, teams):
     near = near.rename(columns={"track_id": "raw_id", "team": "raw_team"}).reset_index(drop=True)
 
     ok = near.d_ball <= POSS_RADIUS
+    # 공이 라인 밖으로 나가면 그 구간은 경기가 멈춘 시간이다. 재개를 기다리며
+    # 자리 잡는 배치를 공간 다툼으로 계산하면 안 되므로 소유자를 두지 않는다.
+    if BALL_OUT_MARGIN > 0:
+        mo = BALL_OUT_MARGIN
+        near["ball_out"] = ~(near.ball_x.between(-mo, PITCH_L + mo)
+                             & near.ball_y.between(-mo, PITCH_W + mo))
+        ok = ok & ~near["ball_out"]
     if "ball_z" in near.columns:
         # 공이 공중에 떠 있으면(크로스·롱볼·헤더) 지면상 가장 가까운 선수가
         # 실제로 그 공을 다루고 있다는 보장이 없다. 헤더 경합처럼 점프와 타이밍으로
@@ -839,6 +1027,12 @@ def calculate_pa(tracks, F, teams, alpha=1.0, beta=1.0, gamma=1.0):
         m = meta.loc[fr]
         if m.phase != "settled" or pd.isna(m.poss_id):
             continue
+        # SC 와 같은 게이트를 쓴다. PA 의 수신공간·길목은 '그 프레임에 보이는
+        # 수비수 전체'로 계산하므로, 수비수가 화면 밖으로 빠진 프레임에서는
+        # 받는 선수가 실제보다 자유로워 보인다. SC 는 usable 로 막아 두고 PA 는
+        # 안 막으면, 추적이 성긴 구간이 PA 만 부풀리는 편향이 된다.
+        if "usable" in meta.columns and not bool(m.usable):
+            continue
         att_t = m.poss_team
         def_t = teams[0] if att_t == teams[1] else teams[1]
         car = g[g.track_id == m.poss_id]
@@ -879,6 +1073,12 @@ def detect_passes(F):
     """
     좌표만으로 패스를 찾는다. 같은 팀 안에서 볼 소유자가 바뀌면 패스로 본다.
     반환: from_frame(패스 직전 프레임), from_id, to_id
+
+    두 소유 구간 사이가 너무 벌어지면 그것은 한 번의 패스가 아니다.
+    공이 라인 밖으로 나갔다가 스로인으로 재개되거나, 공중볼 경합이 길게
+    이어졌거나, 검출이 끊겼던 구간이 여기 걸린다. 가장 긴 롱볼도 3초면
+    도착하므로 그보다 벌어진 쌍은 버린다. 이걸 안 하면 '공이 나가기 직전
+    프레임'의 배치가 스로인의 패스 장면으로 둔갑해 PA 학습의 정답이 된다.
     """
     f = F[F.phase == "settled"].sort_values("frame")
     f = f[f.poss_id.notna()]
@@ -886,6 +1086,8 @@ def detect_passes(F):
     prev_team = f.poss_team.shift()
     prev_frame = f.frame.shift()
     m = (f.poss_id != prev_id) & (f.poss_team == prev_team) & prev_id.notna()
+    if PASS_MAX_GAP_S > 0:
+        m = m & ((f.frame - prev_frame) <= PASS_MAX_GAP_S * FPS)
     return pd.DataFrame({"from_frame": prev_frame[m].astype(int),
                          "from_id": prev_id[m], "to_id": f.poss_id[m]}).reset_index(drop=True)
 
@@ -897,8 +1099,10 @@ def learn_pa_exponents(pa_df, passes):
       음성: 같은 프레임의 나머지 아군
     log 를 씌우면 곱셈 모델이 선형모델이 되므로 로지스틱 회귀로 추정된다.
     """
-    if len(passes) < 30:
-        return None, f"패스 표본이 {len(passes)}개뿐이라 학습을 건너뜀 (30개 이상 필요)"
+    if len(passes) < PA_MIN_PASSES:
+        return None, (f"패스 표본이 {len(passes)}개뿐이라 학습을 건너뛰고 지수 1 을 유지한다 "
+                      f"({PA_MIN_PASSES}개 이상 필요). 표본이 적으면 없는 신호도 "
+                      f"'검증 통과'로 나온다.")
     d = pa_df.merge(passes, left_on=["frame", "carrier_id"],
                     right_on=["from_frame", "from_id"], how="inner")
     if len(d) == 0:
@@ -926,9 +1130,12 @@ def learn_pa_exponents(pa_df, passes):
     rs = np.random.default_rng(0)
     te = set(rs.choice(uniq, max(1, int(len(uniq) * 0.3)), replace=False).tolist())
     m_te = np.array([e in te for e in ev]); m_tr = ~m_te
-    if m_tr.sum() < 20 or m_te.sum() < 10 \
+    n_te_ev = len(te)
+    if n_te_ev < PA_MIN_TEST_PASSES or m_tr.sum() < 20 or m_te.sum() < 10 \
        or len(np.unique(y[m_tr])) < 2 or len(np.unique(y[m_te])) < 2:
-        return None, "학습/검증 분할에 표본이 부족해 지수 1 을 유지 (정의서 §5 A판)"
+        return None, (f"검증에 쓸 패스가 {n_te_ev}개뿐이라(최소 {PA_MIN_TEST_PASSES}개) "
+                      f"지수 1 을 유지 (정의서 §5 A판). AUC 를 이 표본으로 재면 "
+                      f"우연히 좋아 보이는 쪽을 고르게 된다.")
 
     def fit_gain(yy):
         mdl = LogisticRegression(max_iter=2000).fit(X[m_tr], yy[m_tr])
@@ -1015,15 +1222,20 @@ def metric_report(M, PAdf, agg):
             print("  분할 재현성 (앞구간 vs 뒷구간 순위상관): " + " , ".join(out))
             print("      낮으면 표본이 부족하거나, 선수가 아니라 상황을 재고 있는 것이다")
 
-    # 지표가 '어디에 서는 선수인가'로 얼마나 설명되는지
-    if len(agg) > 3 and "d_mean" in agg.columns:
+    # 지표가 '어디에 서는 선수인가'로 얼마나 설명되는지.
+    #   포지션 대용값은 '자기 골대까지의 평균거리'를 쓴다. 공까지의 거리(d_mean)로
+    #   재면 PR 은 정의상 거리의 함수라 동어반복이 되고, 공이 어디 있었는지에도
+    #   휘둘린다. 자기 골대까지의 거리는 공과 무관한 순수 위치 정보다.
+    key = "dist_own_goal" if "dist_own_goal" in agg.columns else "d_mean"
+    if len(agg) > 3 and key in agg.columns:
         from scipy.stats import spearmanr as _sp
+        label = "자기골대까지 거리" if key == "dist_own_goal" else "공까지 평균거리"
         for c in ("SC_mean", "PR_mean", "PA_mean"):
             s = agg[c].dropna()
-            d = agg["d_mean"].reindex(s.index)
+            d = agg[key].reindex(s.index)
             ok = s.notna() & d.notna()
             if ok.sum() > 3:
-                print(f"  {c:8s} vs 공까지 평균거리 ρ={_sp(s[ok], d[ok]).statistic:+.3f}", end="")
+                print(f"  {c:8s} vs {label} ρ={_sp(s[ok], d[ok]).statistic:+.3f}", end="")
         print("\n      |ρ| 가 1 에 가까우면 그 지표는 능력이 아니라 포지션을 재고 있다")
 
 
@@ -1089,7 +1301,8 @@ def total_contribution(agg, tracks, teams):
     a = agg.copy()
     dist_goal = mean_dist_own_goal(tracks, teams)
     gks = detect_goalkeepers(dist_goal, tracks, teams)
-    a["dist_own_goal"] = dist_goal.reindex(a.index).round(1)
+    if "dist_own_goal" not in a.columns:
+        a["dist_own_goal"] = dist_goal.reindex(a.index).round(1)
     a["is_gk"] = a.index.isin(gks)
 
     seen = a.get("frames", pd.Series(0, index=a.index)).fillna(0) \
@@ -1115,7 +1328,12 @@ def total_contribution(agg, tracks, teams):
     if thin.any():
         print(f"           표본 부족으로 제외: {list(a.index[thin])}")
     miss = use & a["TC"].isna()
-    if miss.any():
+    if miss.sum() > 5:
+        print(f"           TC 를 못 낸 선수 {int(miss.sum())}명 — 세 지표가 다 모이지 않았다.")
+        print(f"           SC·PR 은 팀이 수비할 때만, PA 는 공격할 때만 나온다. 한 팀이 관측"
+              f" 구간 내내 공을 갖고 있었다면 한쪽은 수비 기록이, 다른 쪽은 공격 기록이")
+        print(f"           아예 없어서 합칠 수가 없다. 양 팀이 공수를 주고받는 구간이 필요하다.")
+    elif miss.any():
         print(f"           세 지표가 다 있지는 않아 TC 를 못 낸 선수: {list(a.index[miss])}")
 
     if TC_POS_ADJUST:
@@ -1198,13 +1416,32 @@ def self_test():
     far = mid[mid.track_id == "B_far"].PR.mean()
     c7 = (far < 0.02) and (near > 5 * max(far, 1e-9))
 
+    # 원점 판정: 라인 밖 사람이 몇 명 섞여도 구석 원점을 중앙 원점으로 오판하면 안 된다.
+    rr = np.random.default_rng(1)
+    cx = np.r_[rr.uniform(2, PITCH_L - 2, 400), [30., 40., 75.]]     # 벤치·사진기자석
+    cy = np.r_[rr.uniform(2, PITCH_W - 2, 400), [-6., -7., 74.]]
+    c8 = (not looks_centered(cx, cy)) and \
+         looks_centered(cx - PITCH_L / 2, cy - PITCH_W / 2)
+
+    # ID 재연결: 갈 수 없는 거리는 같은 사람으로 잇지 않는다 (붙은 것은 이어야 한다).
+    tk2 = pd.DataFrame({"frame": [0, 0, 1, 1], "time_s": 0.0,
+                        "track_id": ["p1", "p2", "q1", "q2"], "team": "A",
+                        "X": [10.0, 60.0, 10.2, 95.0], "Y": 34.0})
+    old2, FPS = FPS, fps
+    rid = repair_ids(tk2)
+    FPS = old2
+    pick = lambda fr_, x_: rid[(rid.frame == fr_) & (rid.X == x_)].track_id.iloc[0]
+    c9 = (pick(1, 10.2) == pick(0, 10.0)) and (pick(1, 95.0) != pick(0, 60.0))
+
     for nm, c in [("등속 5.00 m/s 정확", c1), ("추적 끊김 구간 NaN", c2),
                   ("team 열 통과", c3), (f"효율성 공리 (오차 {abs(sc.sum()-tot):.0e})", c4),
                   (f"협력 수비 보존 ({s2[0]:.0f} vs {s2[1]:.0f})", c5),
                   ("위험도 가중치 방향", c6),
-                  (f"먼 거리 복귀주력은 압박 아님 (근접 {near:.3f} vs 원거리 {far:.3f})", c7)]:
+                  (f"먼 거리 복귀주력은 압박 아님 (근접 {near:.3f} vs 원거리 {far:.3f})", c7),
+                  ("라인 밖 사람이 있어도 원점 판정 유지", c8),
+                  ("ID 재연결이 순간이동을 잇지 않음", c9)]:
         print(f"  {'PASS' if c else '**FAIL**':9s} {nm}")
-    if not all([c1, c2, c3, c4, c5, c6, c7]):
+    if not all([c1, c2, c3, c4, c5, c6, c7, c8, c9]):
         raise SystemExit("검증 실패. 아래 결과를 믿으면 안 된다.")
 
 
@@ -1231,6 +1468,9 @@ def main():
     if cov0 < 0.7:
         print(f"    ! 공 검출이 {(1-cov0)*100:.0f}% 끊겼다. 보간으로 메울 수 있는 건 짧은 구간뿐이라"
               " 긴 구간은 그대로 버려진다. 공 검출부터 개선할 것.")
+    if "ball_out" in F.columns and F["ball_out"].any():
+        print(f"  데드볼  공이 라인 밖인 프레임 {F['ball_out'].mean()*100:.0f}% "
+              f"— 경기가 멈춘 시간이라 소유자를 두지 않는다")
     print(f"  공소유  usable {F.usable.mean()*100:.0f}% , {F.poss_team.value_counts().to_dict()}")
     if F.usable.mean() < 0.3:
         no_poss = (F.poss_team == "none").mean()
@@ -1289,6 +1529,7 @@ def main():
                           .groupby("track_id")["_z"].mean().round(4))     # 관여율
         agg["PR_in"] = (prm[prm.d <= PR_R].groupby("track_id")["PR"]
                         .mean().round(4))                                 # 관여했을 때의 질
+    agg["dist_own_goal"] = mean_dist_own_goal(L1, teams).reindex(agg.index).round(1)
     metric_report(M, PAdf, agg)
     for c in ["PR_mean", "SC_mean", "PA_mean"]:
         if c in agg.columns:
@@ -1325,7 +1566,14 @@ def main():
         if worst < 0.9:
             print("           ! w 선택이 순위를 바꾼다. 0.5/0.5 를 '검증 전 기준선'으로만"
                   " 쓰고, 결과 라벨이 생기면 반드시 검증할 것.")
-    print(agg.to_string())
+    # 화면에는 읽을 수 있는 만큼만. 전체 열(성분·z점수·정규화값)은 엑셀에 다 들어간다.
+    show = [c for c in ["team", "frames", "dist_own_goal", "is_gk",
+                        "SC_mean", "SC_share", "PR_mean", "PR_zone", "PR_in",
+                        "PA_mean", "PA_frames", "DPI", "TC", "TC_adj"]
+            if c in agg.columns]
+    print(agg[show].to_string())
+    print(f"  (표시한 열은 {len(show)}개다. 성분별 원값과 z 점수 등 전체 "
+          f"{len(agg.columns)}개 열은 {SAVE_XLSX} 의 '선수별' 시트에 있다)")
 
     with pd.ExcelWriter(SAVE_XLSX, engine="openpyxl") as w:
         agg.reset_index().to_excel(w, sheet_name="선수별", index=False)
