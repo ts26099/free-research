@@ -1,9 +1,9 @@
-"""물병던지기 시뮤레이션 — water bottle flip simulation (single file).
+"""물병 낙하 시뮤레이션 — falling water bottle simulation (single file).
 
-A partially filled bottle is released spinning, followed during free flight,
-and **landed**: the run ends with a verdict, stands or falls.  The liquid is
-discretised into elements that move under the fictitious forces of the
-rotating frame, either as
+A partially filled bottle is released **cap first from a height**, given only
+a slow push so that it turns as it falls, and followed during the fall.  The
+liquid is discretised into elements that move under the fictitious forces of
+the rotating frame, either as
 
 * thin coaxial discs sliding along the bottle axis (:func:`simulate`),
 * parcels that also resolve the cross section (:func:`simulate_parcels`), or
@@ -11,54 +11,46 @@ rotating frame, either as
   restitution, attraction between beads, drag, and the fictitious forces of
   the rotating frame (:func:`simulate_beads`).
 
-As the liquid redistributes, the moment of inertia grows and, angular
-momentum being conserved in free flight, the rotation slows down: that is
-what lets the bottle land upright.  Angular momentum here means
-``L = J omega + L_relative`` — the liquid carries about a tenth of the total
-by moving inside the bottle, so it is kept rather than dropped.
+What is measured is what the original model measured: the moment of inertia
+``J(t)``, the angular velocity ``omega(t)`` and the attitude ``theta(t)``.
+As the liquid redistributes, ``J`` grows and, angular momentum being conserved
+in free fall, the rotation slows down.  Angular momentum here means
+``L = J omega + L_relative`` — the liquid carries part of the total by moving
+inside the bottle, so it is kept rather than dropped.
+
+There is no landing model: the run ends when the bottle reaches the floor,
+and what happens on contact is left to the experiment.
+
+The setup
+---------
+* The bottle is held **cap down** (``theta_0 = pi``) and let go from
+  ``drop_height``, so the fall lasts ``sqrt(2 h / g)``.
+* It is not thrown, only pushed, so ``omega_0`` is small — a few rad/s.
+* Being held cap down, the liquid has settled against the cap at release;
+  that is what ``water_at_top`` means (the cap end of the bottle's own axis).
+* In free fall the co-moving frame falls with the bottle, so gravity cancels
+  and the liquid moves only under the centrifugal, Coriolis and Euler forces
+  and the wall drag.
 
 The bottle
 ----------
 The bottle is a real PET bottle, not a cylinder: a body, a shoulder that
 narrows, and a neck (:func:`radius_profile`).  The defaults are a 500 mL
 bottle of 508 mL brimful capacity.  ``neck_radius = bottle_radius`` gives
-back a plain cylinder if you want one.  This matters for the question below,
-because the filling *fraction* is a fraction of that shape's volume, and
-because the shoulder is what holds the liquid back as it is flung towards
-the cap.
-
-The research question
----------------------
-"어떤 충전율에서 가장 잘 세워지는가, 그리고 그것이 액체의 종류나 질량과
-무관한가" — which filling fraction stands best, and is that independent of
-what the liquid is?  Two functions answer it directly:
-
-* :func:`tolerance_scan` — for each filling fraction, sweeps the throw
-  (``omega_0`` and how hard it is tossed) and measures **how many throws
-  stand**.  A good filling fraction is not one that has a perfect throw; it
-  is one that forgives an imperfect one.  :func:`coupling_sensitivity`
-  re-runs it against the landing model's one fitted assumption, so you can
-  see whether the answer depends on it.
-* :func:`substance_scan` — holds the filling fraction and changes only the
-  liquid.  Free flight has no mass in the equation of motion, so the liquid
-  can only reach the answer through ``epsilon = m_bottle / (m_bottle +
-  m_liquid)`` and through the viscous ``tau``.  The scan shows exactly that:
-  a 30% spread with a real bottle, and essentially none once the bottle is
-  made light.
+back a plain cylinder if you want one.  The filling *fraction* is a fraction
+of that shape's volume, and the shoulder is what holds the liquid back as it
+is pushed towards the cap.
 
 Quick start — the physical quantities can be set three ways::
 
     run_interactive()                     # ask for every quantity at the prompt
 
-    params = Parameters(bottle_height=0.21, bottle_radius=0.031,
-                        water_mass=0.17, omega_0=23, model="parcels")
+    params = Parameters(water_mass=0.17, omega_0=5, drop_height=1.5,
+                        model="parcels")
     results = run(params); report(results); draw(results)
 
     results = simulate(water_mass=0.15)   # or just override what you need
     parcel = simulate_parcels(n_pieces=19)
-
-    scan = tolerance_scan(); print(format_tolerance(scan))   # 연구용 / research
-    print(format_substance(substance_scan()))
 
     launch_ui()                           sliders, buttons and figures in a browser
                                           (pasting this file into a notebook
@@ -66,22 +58,20 @@ Quick start — the physical quantities can be set three ways::
 
 From a shell it also works as a script::
 
-    python 물병던지기_시뮤레이션.py --bottle-height 0.21 --water-mass 0.17
+    python 물병던지기_시뮤레이션.py --drop-height 2.0 --water-mass 0.17
     python 물병던지기_시뮤레이션.py --interactive
     python 물병던지기_시뮤레이션.py --ui           # the Gradio interface
     python 물병던지기_시뮤레이션.py --help          # every quantity is an option
 
 What this model does not do
 ---------------------------
-* The bottle is followed only in free flight.  The phase in the hand, where
-  gravity has not yet cancelled and the liquid is already moving, is not
-  simulated; ``include_gravity`` only lets you look at that equation.
+* The bottle is followed only in free fall, from release to the floor.  The
+  moment of release itself, and the landing, are not simulated.
 * Air drag on the bottle is neglected — over half a second it is small
   compared with everything else here.
 * The wall drag is a linear ``-(2/tau) v`` per unit mass, not a solved
   boundary layer, and the free surface is never explicitly tracked.
-* The landing is an energy criterion, not a simulated collision.  See the
-  landing section for the one assumption it makes and how to test it.
+* The bottle turns in one plane; a real release also twists it a little.
 
 References
 ----------
@@ -113,7 +103,7 @@ import numpy as np
 # ===========================================================================
 # 기본값 — default bottle geometry and constants
 # ===========================================================================
-# 물병던지기 모델의 물리 상수.
+# 물병 낙하 모델의 물리 상수.
 #
 # 병은 얇은 벽을 가진 닫힌 원통(흔한 PET 병)으로, 그 안의 물은 병 축을 따라
 # 자유롭게 미끄러질 수 있는 얇은 원판("슬라이스")들이 쌓인 것으로 본다.
@@ -129,10 +119,10 @@ import numpy as np
 # All quantities are in SI units.
 
 # --- Bottle geometry and mass ---
-# 기본값은 실제로 사람들이 던지는 병 — 500 mL PET 생수병이다.  예전 기본값
-# (높이 0.28 m, 반지름 0.04 m)은 부피가 1.4 L 로, 물병던지기 실험에서 쓰는
-# 병이 아니었다.  충전율의 최적값을 묻는 연구라면 병의 모양이 곧 답의 일부이므로
-# 기본 병을 실제 병으로 바꾼다.
+# 기본값은 실제로 실험에 쓰는 병 — 500 mL PET 생수병이다.  예전 기본값
+# (높이 0.28 m, 반지름 0.04 m)은 부피가 1.4 L 였고, 무엇보다 목이 없는
+# 원통이었다.  충전율을 부피 비율로 재는 연구라면 병의 모양이 곧 그 정의의
+# 일부이므로, 기본 병을 실제 병으로 바꾼다.
 BOTTLE_HEIGHT = 0.21  # Height of the bottle, unit: m
 BOTTLE_RADIUS = 0.031  # Radius of the cylindrical body, unit: m
 BOTTLE_MASS = 0.022  # Mass of the empty bottle (with the cap), unit: kg
@@ -156,7 +146,7 @@ G = 9.81  # Gravity constant on Earth, unit: m/s**2
 # ===========================================================================
 # 병의 모양 — the shape of a real bottle
 # ===========================================================================
-# 실제 PET 병은 원통이 아니라 "몸통 - 어깨 - 목" 이다.  이 차이는 물병던지기
+# 실제 PET 병은 원통이 아니라 "몸통 - 어깨 - 목" 이다.  이 차이는 이 실험
 # 에서 그냥 넘길 수 있는 세부가 아니다.
 #
 # * 같은 충전율이라도 물기둥의 높이가 달라진다. 부피의 대부분이 몸통에 있으므로
@@ -383,7 +373,7 @@ def _field(default, kind, unit, label, help_text, choices=None, span=None):
 
 @dataclasses.dataclass
 class Parameters:
-    """Inputs of one flip, with the defaults of a standard 1.4 L PET bottle."""
+    """Inputs of one drop, with the defaults of a 500 mL PET bottle."""
 
     # --- bottle ---
     bottle_height: float = _field(
@@ -411,17 +401,11 @@ class Parameters:
         SHOULDER_END, "float", "1", "어깨 끝 / shoulder ends at",
         "height where the neck radius is reached, as a fraction of the height",
         span=(0.3, 1.0, 0.01))
-    base_radius: float = _field(
-        0.0, "float", "m", "바닥 접지 반지름 / base contact radius",
-        "radius of the ring the bottle actually stands on; 0 takes 85% of the "
-        "body radius, which is what the petaloid base of a PET bottle touches",
-        span=(0.0, 0.09, 0.001))
 
     # --- water ---
     water_mass: float = _field(
         0.17, "float", "kg", "물의 질량 / water mass",
-        "mass of liquid in the bottle; a filling fraction of 0.2-0.4 is where "
-        "the flip works",
+        "mass of liquid in the bottle; the filling fraction follows from it",
         span=(0.005, 0.5, 0.005))
     water_density: float = _field(
         WATER_DENSITY, "float", "kg/m^3", "물의 밀도 / water density",
@@ -444,15 +428,16 @@ class Parameters:
         "accepted, only the magnitude is physical",
         span=(0.0, 1.0, 0.05))
 
-    # --- throw ---
+    # --- 낙하 / the drop ---
     omega_0: float = _field(
-        23.0, "float", "rad/s", "초기 각속도 / initial angular velocity",
-        "angular velocity at release",
-        span=(1.0, 60.0, 0.5))
+        5.0, "float", "rad/s", "초기 각속도 / initial angular velocity",
+        "angular velocity at release; a slow push, not a throw",
+        span=(0.0, 40.0, 0.25))
     theta_0: float = _field(
-        0.0, "float", "rad", "초기 기울기 / initial tilt",
-        "tilt of the bottle axis away from straight up at release; 0 is "
-        "upright (base down), pi is upside down",
+        math.pi, "float", "rad", "초기 기울기 / initial tilt",
+        "tilt of the bottle axis away from straight up at release. 0 is "
+        "upright (base down); pi is cap down, which is how the bottle is "
+        "held here — it is let go cap first",
         span=(-3.1416, 3.1416, 0.05))
     gravity: float = _field(
         G, "float", "m/s^2", "중력가속도 / gravity",
@@ -463,43 +448,19 @@ class Parameters:
         False, "bool", "", "중력 항 포함 / keep gravity in the slice equation",
         "free flight cancels gravity in the co-moving frame; set this only "
         "for the phase where the bottle is still held")
-    t_max: float = _field(
-        0.6, "float", "s", "비행 시간 / flight duration",
-        "duration of the simulated flight; used when flight = 'fixed'",
-        span=(0.05, 2.0, 0.01))
     drop_height: float = _field(
-        None, "optional_float", "m", "낙하 높이 / drop height",
-        "free-fall height; used when flight = 'drop'")
+        1.5, "float", "m", "낙하 높이 / drop height",
+        "height the bottle is released from; the fall lasts sqrt(2h/g)",
+        span=(0.1, 5.0, 0.05))
     flight: str = _field(
-        "launch", "choice", "", "비행 시간의 근거 / what sets the flight time",
-        "'launch' throws the bottle upward at launch_speed and lands it "
-        "release_drop below the release point (a real toss); 'drop' lets it "
-        "fall from drop_height; 'fixed' just uses t_max",
-        choices=("launch", "drop", "fixed"))
-    launch_speed: float = _field(
-        3.0, "float", "m/s", "던져 올리는 속도 / launch speed",
-        "upward speed of the bottle at release; with the drop below, this is "
-        "what sets how long the bottle is in the air",
-        span=(0.0, 6.0, 0.05))
-    release_drop: float = _field(
-        0.1, "float", "m", "놓은 높이 - 착지 높이 / release above landing",
-        "how far the bottle's centre of mass ends up below the release point",
-        span=(-0.5, 1.5, 0.01))
-    impact_absorption: float = _field(
-        1.0, "float", "1", "충돌 흡수율 / impact absorption",
-        "fraction of the falling kinetic energy the base and the water swallow "
-        "on landing; 1 means all of it, and only the residual spin can topple "
-        "the bottle",
-        span=(0.0, 1.0, 0.05))
-    water_coupling: float = _field(
-        0.15, "float", "1", "충돌 시 물의 결합도 / water coupling on impact",
-        "how much of the liquid's rotation is carried into tipping the bottle "
-        "over. The base contact lasts a few ms while the liquid answers over "
-        "tens of ms, so most of the liquid's spin never reaches the tipping "
-        "motion: 0 is a fully decoupled liquid, 1 is a frozen solid. This is "
-        "the one fitted assumption of the landing model - vary it and check "
-        "that your conclusion does not move",
-        span=(0.0, 1.0, 0.05))
+        "drop", "choice", "", "낙하 시간의 근거 / what sets the fall time",
+        "'drop' takes the free-fall time from drop_height; 'fixed' just uses "
+        "t_max",
+        choices=("drop", "fixed"))
+    t_max: float = _field(
+        0.6, "float", "s", "관측 시간 / observed duration",
+        "duration to integrate; used when flight = 'fixed'",
+        span=(0.05, 2.0, 0.01))
 
     # --- discretisation ---
     model: str = _field(
@@ -520,7 +481,10 @@ class Parameters:
         span=(100, 4000, 100))
     water_at_top: bool = _field(
         True, "bool", "", "물이 뚜껑에 붙어 시작 / water starts at the cap",
-        "where the water rests at the moment of release")
+        "where the liquid rests at the moment of release. True is the setup "
+        "here: the bottle is held cap down, so the liquid has settled onto "
+        "the cap before it is let go. 'Top' means the cap end of the bottle's "
+        "own axis, which in this setup points at the floor")
     incompressible: bool = _field(
         True, "bool", "", "비압축성 제약 / incompressibility",
         "keep the water elements from passing through each other")
@@ -632,17 +596,6 @@ class Parameters:
         return float(cumulative_volume(self.bottle_height, **self.shape))
 
     @property
-    def contact_radius(self):
-        """병이 실제로 딛고 서는 바닥 링의 반지름 [m].
-
-        Radius of the ring the bottle actually stands on, unit: m.
-
-        PET 병의 바닥은 평평하지 않고 꽃잎 모양이라, 닿는 자리는 몸통 반지름
-        보다 작다.  넘어지는지 서는지를 가르는 것이 바로 이 반지름이다.
-        """
-        return self.base_radius if self.base_radius else 0.85 * self.bottle_radius
-
-    @property
     def shell_moments(self):
         """빈 병의 질량 분포 — 단위 질량당 ``(z_cm, ring, second)``.
 
@@ -729,7 +682,7 @@ class Parameters:
         ``drag_rate`` 를 0 으로 두면 동점성계수에서 유도한다: 병 반지름 규모의
         전단층이 운동량을 벽으로 나르므로 ``tau ~ R**2 / nu`` 이고, 물처럼
         점성이 낮은 액체에서는 이 값이 비행 시간보다 훨씬 길다 — 즉 물의
-        점성은 뒤집기에 거의 관여하지 않는다.
+        점성은 낙하 동안 거의 관여하지 않는다.
         """
         if self.drag_rate > 0:
             return 2 / self.drag_rate
@@ -756,31 +709,19 @@ class Parameters:
 
     @property
     def duration(self):
-        """시뮬레이션하는 비행 시간 [s].
+        """관측하는 낙하 시간 [s].
 
-        Simulated flight duration, unit: s.
+        Duration of the fall, unit: s.
 
-        ``flight = "launch"`` 이면 실제로 던져 올린 병이 공중에 있는 시간이다:
-        위로 ``launch_speed`` 로 던져 ``release_drop`` 만큼 아래에 떨어지므로
-        ``t = (v + sqrt(v**2 + 2 g h)) / g``.  비행 시간은 뒤집기의 성패를
-        좌우하는데, 예전처럼 0.6 s 로 고정해 두면 던지는 세기를 바꿔도 시간이
-        따라오지 않아 실제 던지기와 어긋난다.
+        병은 던지는 것이 아니라 높은 곳에서 가만히 놓는다. 그러므로 공중에
+        있는 시간은 낙하 높이 하나가 정한다: ``t = sqrt(2 h / g)``.
+        높이를 무시하고 시간을 손으로 주고 싶으면 ``flight = "fixed"``.
         """
-        if self.flight == "launch":
-            v = self.launch_speed
-            g = self.gravity
-            if g <= 0:
-                raise ValueError("a launched flight needs a non-zero gravity")
-            inside = v ** 2 + 2 * g * self.release_drop
-            if inside < 0:
-                raise ValueError(
-                    "the bottle never comes back down to the landing height")
-            return (v + math.sqrt(inside)) / g
         if self.flight == "drop":
             if self.drop_height is None:
                 raise ValueError("flight = 'drop' needs a drop_height")
-            return math.sqrt(2 * self.drop_height / self.gravity)
-        if self.drop_height is not None:
+            if self.gravity <= 0:
+                raise ValueError("a drop needs a non-zero gravity")
             return math.sqrt(2 * self.drop_height / self.gravity)
         return self.t_max
 
@@ -832,16 +773,8 @@ class Parameters:
             raise ValueError(
                 "the shoulder must satisfy 0 < shoulder_start <= shoulder_end "
                 "<= 1 (got %r, %r)" % (self.shoulder_start, self.shoulder_end))
-        if self.base_radius < 0 or self.base_radius > self.bottle_radius:
-            raise ValueError("base_radius must be between 0 and bottle_radius")
-        if self.flight not in ("launch", "drop", "fixed"):
-            raise ValueError("flight must be 'launch', 'drop' or 'fixed'")
-        if self.launch_speed < 0:
-            raise ValueError("launch_speed must not be negative")
-        if not 0 <= self.impact_absorption <= 1:
-            raise ValueError("impact_absorption must be between 0 and 1")
-        if not 0 <= self.water_coupling <= 1:
-            raise ValueError("water_coupling must be between 0 and 1")
+        if self.flight not in ("drop", "fixed"):
+            raise ValueError("flight must be 'drop' or 'fixed'")
         if not 0 < self.water_mass < self.water_mass_max:
             raise ValueError(
                 "water_mass must be between 0 and %.4f kg for this bottle "
@@ -919,8 +852,6 @@ class Parameters:
                      % self.tau)
         lines.append("  비행 시간 / flight duration                   %12.4f s"
                      % self.duration)
-        lines.append("  접지 반지름 / base contact radius             %12.4f m"
-                     % self.contact_radius)
         return "\n".join(lines)
 
 
@@ -928,13 +859,11 @@ FIELDS = {field.name: field for field in dataclasses.fields(Parameters)}
 
 FIELD_GROUPS = [
     ("병 / bottle", ("bottle_height", "bottle_radius", "bottle_mass",
-                     "neck_radius", "shoulder_start", "shoulder_end",
-                     "base_radius")),
+                     "neck_radius", "shoulder_start", "shoulder_end")),
     ("물 / water", ("water_mass", "water_density", "kinematic_viscosity",
                     "drag_rate", "restitution")),
-    ("던지기 / throw", ("omega_0", "theta_0", "gravity", "include_gravity",
-                        "flight", "launch_speed", "release_drop",
-                        "impact_absorption", "t_max", "drop_height")),
+    ("떨어뜨리기 / drop", ("omega_0", "theta_0", "gravity", "include_gravity",
+                           "flight", "drop_height", "t_max")),
     ("이산화 / discretisation",
      ("model", "n_slices", "n_pieces", "n_steps", "water_at_top",
       "incompressible", "coriolis", "euler", "relative_momentum",
@@ -1295,7 +1224,7 @@ def neighbour_pairs(positions, cutoff, chunk=None):
 # 벽 항력을 받고, 그 방정식은 계수를 얼려 두면 정확히 풀린다.
 #
 # 자유비행 중에는 각운동량이 보존되므로 ``omega`` 는 ``L = J omega`` 에서
-# 나온다. 물이 퍼지면서 ``J`` 가 커지고 회전이 느려지는 것이 물병던지기의
+# 나온다. 물이 퍼지면서 ``J`` 가 커지고 회전이 느려지는 것이 이 실험의
 # 원리다.
 #
 # 가장 빠르지만, 단면 안에서 물이 움직이지 못하므로 감속을 과대평가한다.
@@ -1330,7 +1259,7 @@ def neighbour_pairs(positions, cutoff, chunk=None):
 # Angular momentum is conserved in free flight, so ``omega`` follows from
 # ``L = J * omega`` with ``J`` recomputed from the instantaneous water
 # distribution; the redistribution of water raises ``J`` and therefore slows
-# the rotation down, which is the mechanism behind the bottle flip.
+# the rotation down, which is the mechanism this simulation is about.
 #
 # References
 # ----------
@@ -2390,7 +2319,7 @@ def wall_accelerations(positions, velocities, bead_radius, bead_mass,
     ``shape`` 를 주면 벽은 원통이 아니라 실제 병의 회전면 ``r = R(z)`` 이다.
     어깨에서는 벽이 기울어져 있으므로 법선이 축 방향 성분을 갖는다 — 물을
     안쪽으로만이 아니라 **아래로도** 밀어내는 이 성분이, 원심력에 밀려 올라온
-    물을 목이 붙잡는 힘이다.  원통 벽에는 없는 항이고, 뒤집기에서 물이
+    물을 목이 붙잡는 힘이다.  원통 벽에는 없는 항이고, 낙하 중에 물이
     얼마나 퍼지는지를 실제로 좌우한다.
     """
     accelerations = np.zeros_like(positions)
@@ -2522,9 +2451,9 @@ def relative_angular_momentum(positions, velocities, y_cm, z_cm, bead_mass):
 # ===========================================================================
 # 시뮬레이션과 그림 — integration, reporting, plots
 # ===========================================================================
-# 뒤집기 한 번을 적분하고, 요약하고, 그림을 그린다.
+# 낙하 한 번을 적분하고, 요약하고, 그림을 그린다.
 #
-# 병을 회전시켜 놓고 자유비행을 따라간다. 물은 모델에 따라 원판·조각·구슬로
+# 병을 천천히 밀어 놓고 자유낙하를 따라간다. 물은 모델에 따라 원판·조각·구슬로
 # 나뉘어 회전좌표계의 힘을 받아 움직이고, 물이 퍼지면서 관성모멘트가 커지면
 # 각운동량 보존에 따라 회전이 느려진다.
 #
@@ -2537,7 +2466,7 @@ def relative_angular_momentum(positions, velocities, y_cm, z_cm, bead_mass):
 # * ``progress`` 콜백으로 진행률을 알린다 — 몇 분씩 걸리는 계산이 멈춘 것처럼
 #   보이지 않게.
 #
-# Simulate the flight of a partially filled bottle thrown in a flip.
+# Simulate the fall of a partially filled bottle released cap first.
 #
 # The bottle is released spinning and followed during free flight.  The water is
 # discretised into elements that move under the fictitious forces of the
@@ -2552,10 +2481,10 @@ def relative_angular_momentum(positions, velocities, y_cm, z_cm, bead_mass):
 #
 # Run ``python 물병던지기_시뮤레이션.py --help`` for the available options.
 
-NOTEBOOK_HINT = """물병던지기 시뮤레이션 / water bottle flip — 코드로 쓰는 방법:
+NOTEBOOK_HINT = """물병 낙하 시뮤레이션 / falling bottle — 코드로 쓰는 방법:
   launch_ui()                                 슬라이더와 버튼 / sliders and buttons
   run_interactive()                           물리량을 하나씩 입력 / one prompt each
-  report(run(Parameters(water_mass=0.4)))     코드에서 직접 / straight from code"""
+  report(run(Parameters(water_mass=0.17)))    코드에서 직접 / straight from code"""
 
 GRADIO_MISSING = """UI 를 열려면 gradio 가 필요합니다 / the interface needs gradio:
 
@@ -2663,25 +2592,26 @@ def _substep_plan(params, dt, bead_mass):
 
 
 def _warn_if_degenerate(low, high, center_of_mass, params):
-    """뒤집기가 되려면 물기둥이 질량중심을 걸치고 있어야 한다.
+    """물이 재분포하려면 물기둥이 질량중심을 걸치고 있어야 한다.
 
-    The flip needs the water column to straddle the centre of mass.
+    The water can only redistribute if its column straddles the centre of mass.
     """
     if not low < center_of_mass < high:
         warnings.warn(
             "the water column (%.3f-%.3f m) lies entirely on one side of the "
-            "centre of mass (%.3f m): the centrifugal force pushes every "
-            "element against the same cap, so the water cannot redistribute "
-            "and the angular velocity stays constant. Use a filling fraction "
-            "of roughly 0.2-0.4 (currently %.3f)."
+            "centre of mass (%.3f m) at a filling fraction of %.3f: the "
+            "centrifugal force pushes every element against the same cap, so "
+            "the water cannot redistribute, J stays put and omega with it. "
+            "This run is degenerate rather than wrong - raise the filling "
+            "fraction to get any redistribution at all."
             % (low, high, center_of_mass, params.filling_fraction),
             RuntimeWarning, stacklevel=3)
 
 
 def simulate(params=None, progress=None, **overrides):
-    """물을 병 축을 따라 미끄러지는 원판으로 보고 뒤집기를 적분한다.
+    """물을 병 축을 따라 미끄러지는 원판으로 보고 낙하를 적분한다.
 
-    Integrate the flip with the water as discs sliding along the axis.
+    Integrate the fall with the water as discs sliding along the axis.
 
     원판은 같은 **질량** 을 갖는다. 단면이 변하는 병에서는 그것이 같은 두께를
     뜻하지 않으므로, 원판의 자리는 부피 좌표에서 잡고 (:func:`height_at_volume`)
@@ -2810,9 +2740,9 @@ def simulate(params=None, progress=None, **overrides):
 
 
 def simulate_parcels(params=None, progress=None, **overrides):
-    """물을 조각으로 쪼개어 뒤집기를 적분한다.
+    """물을 조각으로 쪼개어 낙하를 적분한다.
 
-    Integrate the flip with the water cut into parcels.
+    Integrate the fall with the water cut into parcels.
 
     Each disc of the coarse model is cut into ``n_pieces`` pieces that move in
     the flip plane, so the water can climb the side wall and cross the bottle
@@ -2942,9 +2872,9 @@ def simulate_parcels(params=None, progress=None, **overrides):
 
 
 def simulate_beads(params=None, progress=None, **overrides):
-    """물을 구슬로 보고, 실제로 작용하는 힘으로 뒤집기를 적분한다.
+    """물을 구슬로 보고, 실제로 작용하는 힘으로 낙하를 적분한다.
 
-    Integrate the flip with the water as beads, moved by actual forces.
+    Integrate the fall with the water as beads, moved by actual forces.
 
     Every effect is a force: bead-bead and bead-wall contacts (a linear
     spring-dashpot whose damping comes from ``restitution``), the attraction
@@ -3124,7 +3054,7 @@ def simulate_beads(params=None, progress=None, **overrides):
 
 
 def run(params=None, progress=None, **overrides):
-    """``params.model`` 이 고른 모델로 한 번 던진다.
+    """``params.model`` 이 고른 모델로 한 번 떨어뜨린다.
 
     ``progress`` 는 그 모델에 그대로 넘긴다: 큰 계산에서 진행 상황을 보려면
     :func:`console_progress` 가 만든 콜백을 주면 된다.
@@ -3137,151 +3067,12 @@ def run(params=None, progress=None, **overrides):
     return simulate(p, progress=progress)
 
 
-# ===========================================================================
-# 착지 — does it actually stand up?
-# ===========================================================================
-# 예전 코드는 "최종 각속도" 와 "몇 바퀴 돌았나" 까지만 알려 주었다. 그런데
-# 물병 세우기 연구가 묻는 것은 그것이 아니라 **섰는가 넘어졌는가** 이다.
-# 회전이 느려지는 것은 필요조건일 뿐, 그것만으로는 세워지지 않는다.
-#
-# 병이 서려면 두 가지가 함께 맞아야 한다.
-#
-# 1. 닿는 순간 거의 똑바로 서 있어야 한다. 기울기가 이미 접지 반지름이 허용하는
-#    한계를 넘으면, 각속도가 0 이어도 그대로 넘어간다.
-# 2. 남은 회전에너지가 질량중심을 접지 링 위로 넘길 만큼 크면 안 된다.
-#    바닥 모서리를 축으로 도는 문제이므로, 문턱은 질량중심을 그 모서리 바로
-#    위까지 들어올리는 위치에너지다.
-#
-# 두 조건은 모두 접지 반지름 ``contact_radius`` 와 질량중심 높이에 달려 있고,
-# 그래서 충전율이 답에 들어온다: 물이 적으면 회전이 안 느려지고, 물이 많으면
-# 질량중심이 높아져 문턱이 낮아진다.
-#
-# 충돌에 대한 가정
-# ----------------
-# 떨어지는 속도가 갖는 병진 운동에너지는 기본값에서 **모두 흡수된다** 고 본다.
-# 실제로 PET 병의 바닥은 찌그러지고, 안의 물은 바닥을 때리면서 자기 운동에너지를
-# 거의 다 잃는다 — 물병 세우기가 성립하는 이유 자체가 이 소산이다.
-# ``impact_absorption`` 을 1 보다 작게 주면 그 중 일부가 넘어뜨리는 데 쓰인다.
-# 이것은 모델의 선택이지 계산 결과가 아니므로, 값을 바꿔 가며 결론이 얼마나
-#흔들리는지 보는 편이 낫다.
-
 def wrap_angle(angle):
     """각도를 ``(-pi, pi]`` 로 접는다.
 
     Wrap an angle into ``(-pi, pi]``.
     """
     return -(-(np.asarray(angle, dtype=float) + np.pi) % (2 * np.pi) - np.pi)
-
-
-def landing_outcome(results, impact_absorption=None, water_coupling=None):
-    """착지 순간의 자세와 남은 회전으로 섰는지 넘어졌는지 판정한다.
-
-    Decide whether the bottle stands, from its attitude and residual spin.
-
-    Returns a dict with the landing tilt, the tipping threshold, the energy
-    margin and ``stands``.
-    """
-    p = results["parameters"]
-    if impact_absorption is None:
-        impact_absorption = p.impact_absorption
-    coupling = p.water_coupling if water_coupling is None else water_coupling
-    theta = results["theta"]
-    omega = results["omega"]
-
-    tilt = float(wrap_angle(theta[-1]))
-    spin = float(omega[-1])
-    water_mass = float(results.get("water_mass_used", p.water_mass))
-    total_mass = p.bottle_mass + water_mass
-    j_cm = float(results["rotational_inertia"][-1])
-
-    # 병 좌표계에서의 질량중심 (축에서 벗어난 성분까지)
-    z_cm = float(results["center_of_mass"][-1])
-    y_cm = float(np.asarray(results.get("center_of_mass_y", 0.0)).ravel()[-1]) \
-        if results.get("center_of_mass_y") is not None else 0.0
-
-    contact = p.contact_radius
-
-    def rim(side):
-        """한쪽 바닥 모서리를 축으로 본 기하: 균형점 기울기와 지금 높이."""
-        arm_y = y_cm - side * contact
-        reach = math.hypot(arm_y, z_cm)
-        # h(theta) = reach * cos(theta + delta):
-        # 똑바로 서 있으면 z_cm, 균형점에서 reach 로 가장 높다.
-        delta = math.atan2(arm_y, z_cm) if reach > 0 else 0.0
-        return reach, delta, -delta, reach * math.cos(tilt + delta)
-
-    # 닿는 순간 이미 어느 한쪽 균형점을 넘어 기울어져 있으면, 각속도가 0
-    # 이어도 그대로 넘어간다. 두 모서리를 모두 본다.
-    past_balance = False
-    for side in (1.0, -1.0):
-        _, _, tip, _ = rim(side)
-        if (tilt - tip) * side >= 0:
-            past_balance = True
-
-    # 넘어뜨리는 일은 회전이 데려가는 쪽 모서리를 축으로 일어난다
-    side = 1.0 if spin >= 0 else -1.0
-    reach, delta, tip_tilt, height_now = rim(side)
-
-    # 모서리를 축으로 한 관성모멘트 (평행축 정리).
-    # 여기서 물과 병을 나눈다. 바닥이 상에 닿는 충돌은 몇 ms 로 끝나는데
-    # 안의 물이 반응하는 데는 수십 ms 가 걸리므로, 물이 갖고 있던 회전은
-    # 병을 넘어뜨리는 운동으로 거의 넘어가지 않는다.  넘어뜨리는 데 쓰이는
-    # 관성은 병 껍질의 것에 물의 일부(``water_coupling``)를 더한 만큼이다.
-    # 반면 병을 도로 눌러 세우는 무게는 물까지 포함한 전체 질량이다 —
-    # 이 비대칭이 부분적으로 채운 병이 서는 이유다.
-    j_bottle_pivot = p.bottle_inertia(z_cm, y_cm) + p.bottle_mass * reach ** 2
-    j_water_pivot = max(j_cm + total_mass * reach ** 2 - j_bottle_pivot, 0.0)
-    j_pivot = j_bottle_pivot + coupling * j_water_pivot
-    kinetic = 0.5 * j_pivot * spin ** 2
-    if impact_absorption < 1.0:
-        # 흡수되지 않은 낙하 운동에너지가 넘어뜨리는 데 더해진다
-        fall_speed = abs(p.gravity * results["t"][-1]
-                         - (p.launch_speed if p.flight == "launch" else 0.0))
-        kinetic += (1.0 - impact_absorption) * 0.5 * total_mass * fall_speed ** 2
-    barrier = total_mass * p.gravity * max(reach - height_now, 0.0)
-
-    stands = bool(not past_balance and kinetic < barrier)
-
-    return {
-        "tilt": tilt,
-        "tilt_deg": math.degrees(tilt),
-        "spin": spin,
-        "tip_tilt": tip_tilt,
-        "tip_tilt_deg": math.degrees(tip_tilt),
-        "kinetic": kinetic,
-        "barrier": barrier,
-        "margin": barrier - kinetic,
-        "stands": stands,
-        "past_balance": bool(past_balance),
-        "water_coupling": coupling,
-        "j_pivot": j_pivot,
-        "contact_radius": contact,
-        "center_height": z_cm,
-        "turns": float((theta[-1] - theta[0]) / (2 * np.pi)),
-    }
-
-
-def format_landing(results, impact_absorption=None, water_coupling=None):
-    """착지 판정을 사람이 읽는 글로.
-
-    The landing verdict, as text.
-    """
-    out = landing_outcome(results, impact_absorption, water_coupling)
-    verdict = "섰다 / STANDS" if out["stands"] else "넘어졌다 / FALLS"
-    lines = ["--- 착지 / landing " + "-" * 34,
-             "판정 / verdict   : %s" % verdict,
-             "착지 기울기      : %+.1f deg (넘어가는 한계 %.1f deg)"
-             % (out["tilt_deg"], abs(out["tip_tilt_deg"])),
-             "남은 각속도      : %.2f rad/s" % out["spin"],
-             "회전에너지/문턱  : %.3e / %.3e J (여유 %+.3e J)"
-             % (out["kinetic"], out["barrier"], out["margin"])]
-    if out["past_balance"]:
-        lines.append("이유             : 닿는 순간 이미 균형점을 넘어 기울어져 "
-                     "있었다 / already past the balance point on landing")
-    elif not out["stands"]:
-        lines.append("이유             : 남은 회전이 질량중심을 접지 모서리 "
-                     "위로 넘긴다 / the residual spin carries it over the rim")
-    return "\n".join(lines)
 
 
 def format_report(results, show_inputs=True):
@@ -3351,16 +3142,16 @@ def format_report(results, show_inputs=True):
                     np.max(np.abs(total - results["angular_momentum"]))))
     lines.append("rotation in %.2f s: %.2f rad = %.3f turns"
                  % (results["t"][-1], theta[-1] - theta[0], turns))
-    lines.append("landing angle    : %.3f rad (%.0f deg from the release "
-                 "attitude)"
-                 % (theta[-1] % (2 * np.pi),
+    # theta 는 연직 위에서 잰 기울기다: 0 이면 바로 선 병, pi 면 뚜껑이 아래.
+    lines.append("attitude at end  : %.0f deg from upright (%.0f deg turned "
+                 "since release)"
+                 % (abs(np.degrees(wrap_angle(theta[-1]))),
                     np.degrees((theta[-1] - theta[0]) % (2 * np.pi))))
     if results.get("history_stride", 1) > 1:
         lines.append("이력 기록         : %d 스텝마다 %d 장 (메모리 예산 "
                      "안에서 그림을 그리려고 솎아냄)"
                      % (results["history_stride"],
                         results["history_steps"].size))
-    lines.append(format_landing(results))
     return "\n".join(lines)
 
 
@@ -3370,493 +3161,6 @@ def report(results, show_inputs=True):
     Print :func:`format_report`.
     """
     print(format_report(results, show_inputs))
-
-
-# ===========================================================================
-# 연구용 스캔 — the measurements the research question actually needs
-# ===========================================================================
-# 이 연구의 물음은 두 가지다.
-#
-# 1. 충전율이 얼마일 때 가장 잘 세워지는가 (30~40% 인가)?
-# 2. 그 답이 액체의 **종류나 질량** 과 무관하고 **부피 비율** 에만 달렸는가?
-#
-# 한 번의 던지기로는 어느 쪽도 답할 수 없다. 던지는 세기를 조금만 바꿔도
-# 병은 서기도 하고 넘어지기도 하기 때문이다.  실제로 "잘 세워진다" 는 말은
-# **성공하는 던지기의 범위가 넓다** 는 뜻이다 — 그것이 아래 :func:`tolerance_scan`
-# 이 재는 양이다.
-#
-# 2 번에 대해서는 미리 알아 둘 것이 있다. 자유비행 중 물 요소의 운동방정식
-#
-#     r'' = omega**2 (r - r_cm) - (2/tau) r'
-#
-# 에는 질량도 밀도도 들어 있지 않다.  각속도는 ``omega = L / J`` 에서 나오는데
-# 물만 있다면 ``L`` 과 ``J`` 가 똑같이 질량에 비례해서 약분된다.  그러므로
-# 액체의 밀도와 질량이 결과에 들어오는 통로는 **딱 두 개** 뿐이다.
-#
-# * ``epsilon = m_bottle / (m_bottle + m_liquid)`` — 빈 병이 전체 질량에서
-#   차지하는 몫. 병이 가벼울수록 0 에 가까워지고, 그때 비로소 "액체의 종류와
-#   무관" 이 성립한다.
-# * ``tau`` — 점성이 정하는 벽 항력의 감쇠 시간. 물처럼 묽은 액체에서는 비행
-#   시간보다 훨씬 길어 거의 관여하지 않지만, 꿀이라면 이야기가 다르다.
-#
-# 즉 가설은 "무관하다" 가 아니라 "**epsilon 과 tau 를 통해서만 관계된다**" 가
-# 맞다.  :func:`substance_scan` 이 그것을 직접 확인한다: 충전율을 고정한 채
-# 밀도만 바꾸면 결과가 얼마나 움직이는가, 그리고 병을 가볍게 하면 그 차이가
-# 사라지는가.
-
-def research_summary(params=None, quick=True, echo=print, **overrides):
-    """연구의 두 물음에 한 번에 답한다 — 최적 충전율과, 액체 종류의 영향.
-
-    Answer both research questions in one call.
-
-    세 가지를 차례로 계산해 출력한다.
-
-    1. :func:`tolerance_scan` — 충전율마다 성공하는 던지기의 폭.
-    2. :func:`coupling_sensitivity` — 착지 모델의 가정을 흔들어도 최적값이
-       그대로인가.
-    3. :func:`substance_scan` — 충전율을 고정하고 액체만 바꾸면 결과가
-       달라지는가.
-
-    ``quick`` 을 끄면 격자를 촘촘히 잡는다 (몇 분 걸린다).
-    """
-    p = resolve_parameters(params, **overrides)
-    if quick:
-        fractions = np.round(np.arange(0.10, 0.76, 0.05), 3)
-        speeds = np.array([3.0, 4.0])
-        couplings = (0.0, 0.15, 0.35)
-        p = p.replace(n_steps=200, n_slices=60)
-    else:
-        fractions = np.round(np.arange(0.05, 0.81, 0.025), 3)
-        speeds = np.array([2.5, 3.0, 3.5, 4.0])
-        couplings = (0.0, 0.05, 0.15, 0.30, 0.50)
-
-    echo("=" * 70)
-    echo("1. 어느 충전율이 가장 잘 세워지는가 / which filling fraction stands")
-    echo("=" * 70)
-    scan = tolerance_scan(p, fractions=fractions, speeds=speeds)
-    echo(format_tolerance(scan))
-
-    echo("")
-    echo("=" * 70)
-    echo("2. 그 답이 착지 모델의 가정에 기대고 있는가 / is that robust")
-    echo("=" * 70)
-    sensitivity = coupling_sensitivity(p, couplings=couplings,
-                                       fractions=fractions, speeds=speeds)
-    echo(format_coupling_sensitivity(sensitivity))
-
-    echo("")
-    echo("=" * 70)
-    echo("3. 액체의 종류나 질량과 무관한가 / does the liquid itself matter")
-    echo("=" * 70)
-    substance = substance_scan(
-        p, fraction=scan["best_fraction"] or p.filling_fraction)
-    echo(format_substance(substance))
-
-    echo("")
-    echo("=" * 70)
-    echo("결론 / conclusion")
-    echo("=" * 70)
-    bests = [row["best_fraction"] for row in sensitivity["rows"]
-             if row["best_fraction"] is not None]
-    real = [row["turns"] for row in substance["rows"]
-            if "보통" in row["variant"]]
-    light = [row["turns"] for row in substance["rows"]
-             if "가벼운" in row["variant"]]
-    if scan["best_fraction"] is None:
-        echo("* 이 설정에서는 어떤 충전율에서도 병이 서지 않았다. 던짐 속도 "
-             "범위를 넓히거나 water_coupling 을 낮춰서 다시 보라.")
-    elif bests:
-        echo("* 가장 넓게 성공하는 충전율은 %.2f 이고, 착지 가정을 %.2f~%.2f "
-             "로 바꾸어도 %.2f~%.2f 사이에 머문다."
-             % (scan["best_fraction"], min(couplings), max(couplings),
-                min(bests), max(bests)))
-    else:
-        echo("* 가장 넓게 성공하는 충전율은 %.2f 다." % scan["best_fraction"])
-    if real:
-        spread_real = (max(real) - min(real)) / max(np.mean(real), 1e-12)
-        echo("* 같은 충전율에서 액체를 바꾸면 회전수가 %.0f%% 달라진다 — "
-             "따라서 '액체의 종류와 무관' 은 엄밀히는 참이 아니다."
-             % (100 * spread_real))
-    if light:
-        spread_light = (max(light) - min(light)) / max(np.mean(light), 1e-12)
-        echo("* 그런데 병을 가볍게 하면 그 차이가 %.1f%% 로 사라진다. 즉 액체가 "
-             "결과에 들어오는 통로는 epsilon = m_bottle/(m_bottle+m_liquid) "
-             "하나이고, 부피 비율이 나머지 전부를 정한다."
-             % (100 * spread_light))
-    echo("* 자유비행의 운동방정식 r'' = omega^2 (r - r_cm) - (2/tau) r' 에는 "
-         "질량이 없다. 위의 두 줄이 그 결과다.")
-    return {"tolerance": scan, "sensitivity": sensitivity,
-            "substance": substance}
-
-
-def _throw_succeeds(params, omega_0, model=None, **overrides):
-    """던지기 하나를 계산해 섰는지만 돌려준다.
-
-    Run one throw and report only whether the bottle stands.
-    """
-    p = params.replace(omega_0=omega_0, **overrides)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        try:
-            results = run(p) if model is None else run(p.replace(model=model))
-        except ValueError:
-            return None
-    return landing_outcome(results)
-
-
-def _flight_of(params, omega_0, **overrides):
-    """던지기 하나를 계산한다 (경고는 삼킨다).
-
-    Run one throw, swallowing the warnings.
-    """
-    case = params.replace(omega_0=float(omega_0), **overrides)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        return run(case)
-
-
-def turns_of(params, omega_0, **overrides):
-    """이 던지기가 비행 동안 도는 바퀴 수.
-
-    How many turns this throw makes in flight.
-
-    ``omega_0`` 에 대해 단조증가한다 — 그래서 "정확히 한 바퀴 도는 던지기" 를
-    이분법으로 찾을 수 있다.
-    """
-    results = _flight_of(params, omega_0, **overrides)
-    return float((results["theta"][-1] - results["theta"][0]) / (2 * np.pi))
-
-
-def throw_for_turns(params, target=1.0, bounds=(2.0, 90.0), tol=1e-3,
-                    **overrides):
-    """딱 ``target`` 바퀴를 도는 초기 각속도를 찾는다 (이분법).
-
-    The initial spin that makes exactly ``target`` turns, by bisection.
-
-    Returns ``None`` if no throw in ``bounds`` turns that much.
-    """
-    low, high = bounds
-    f_low = turns_of(params, low, **overrides) - target
-    f_high = turns_of(params, high, **overrides) - target
-    if f_low > 0 or f_high < 0:
-        return None
-    while high - low > tol:
-        mid = 0.5 * (low + high)
-        if turns_of(params, mid, **overrides) - target < 0:
-            low = mid
-        else:
-            high = mid
-    return 0.5 * (low + high)
-
-
-def standing_window(params, target=1.0, bounds=(2.0, 90.0), tol=1e-3,
-                    **overrides):
-    """세워지는 초기 각속도의 구간을 정확히 잰다.
-
-    The interval of initial spins that stand, measured exactly.
-
-    격자를 촘촘히 훑는 대신, 먼저 ``target`` 바퀴를 도는 던지기를 이분법으로
-    찾고 (거기서 병은 똑바로 선 채로 닿는다), 거기서 양쪽으로 벌려 가며
-    성패가 갈리는 경계를 다시 이분법으로 찾는다.  격자 간격에 답이 좌우되지
-    않으므로, 충전율끼리 견주는 데 쓸 수 있는 수가 나온다.
-
-    ``width`` 가 곧 "손이 이만큼 흔들려도 세워진다" 는 폭 [rad/s] 이다.
-    """
-    center = throw_for_turns(params, target, bounds, tol, **overrides)
-    if center is None:
-        return {"center": None, "low": None, "high": None, "width": 0.0}
-
-    # 세워지는 구간은 "딱 한 바퀴" 던지기에 **중심을 두지 않는다**.  넘어가는
-    # 한계 기울기가 10~15 도쯤이므로 자세만 보면 한 바퀴에서 ±0.04 바퀴까지
-    # 괜찮지만, 그 안에서도 남은 회전이 느린 쪽 — 즉 omega_0 이 조금 작은
-    # 쪽 — 에서만 실제로 선다.  그래서 자세가 허용되는 구간 전체를 감싸는
-    # 범위를 잡고 그 안을 훑는다.
-    span = []
-    for offset in (-0.10, 0.10):
-        edge_throw = throw_for_turns(params, target + offset, bounds, tol,
-                                     **overrides)
-        span.append(edge_throw)
-    low_bound = span[0] if span[0] is not None else bounds[0]
-    high_bound = span[1] if span[1] is not None else bounds[1]
-    if high_bound <= low_bound:
-        return {"center": center, "low": None, "high": None, "width": 0.0}
-
-    def stands(omega_0):
-        return landing_outcome(
-            _flight_of(params, omega_0, **overrides))["stands"]
-
-    samples = np.linspace(low_bound, high_bound, 41)
-    hits = [w for w in samples if stands(w)]
-    if not hits:
-        return {"center": center, "low": None, "high": None, "width": 0.0}
-
-    def edge(good, bad):
-        """성공과 실패 사이의 경계를 이분법으로."""
-        while abs(bad - good) > tol:
-            mid = 0.5 * (good + bad)
-            if stands(mid):
-                good = mid
-            else:
-                bad = mid
-        return good
-
-    step = samples[1] - samples[0]
-    low = edge(hits[0], max(hits[0] - step, low_bound - step))
-    high = edge(hits[-1], min(hits[-1] + step, high_bound + step))
-    return {"center": center, "low": low, "high": high, "width": high - low}
-
-
-def tolerance_scan(params=None, fractions=None, speeds=None, target=1.0,
-                   progress=None, **overrides):
-    """충전율마다, 성공하는 던지기의 폭이 얼마나 넓은지 잰다.
-
-    For each filling fraction, how wide the range of throws that stand is.
-
-    충전율마다 :func:`standing_window` 로 **세워지는 초기 각속도의 폭** 을
-    이분법으로 정확히 재고, 던져 올리는 속도(곧 비행 시간)도 몇 가지로 바꿔
-    가며 되풀이한다.
-
-    이것이 "잘 세워진다" 의 조작적 정의다.  사람은 매번 똑같이 던지지 못하므로,
-    좋은 충전율이란 어떤 한 번의 완벽한 던지기가 성공하는 충전율이 아니라
-    **손이 흔들려도 성공하는 폭이 넓은** 충전율이다.  격자를 훑는 대신 경계를
-    이분법으로 찾으므로, 이 폭은 격자 간격에 좌우되지 않는다.
-
-    ``width`` 는 rad/s 단위의 절대 폭이고, ``relative`` 는 그것을 알맞은 던지기
-    세기로 나눈 것이다 — 사람의 던지기 오차는 절대값보다 비율에 가깝다.
-
-    어느 모델로 훑을까
-    ------------------
-    충전율을 촘촘히 훑을 때는 ``slices`` 를 쓴다.  원판은 충전율이 얼마든
-    같은 개수로 나뉘므로 곡선이 매끄럽다.  ``parcels`` 와 ``beads`` 는 충전율을
-    조금 바꿀 때마다 격자에 놓이는 조각·구슬의 층수가 뚝뚝 달라져서, 그
-    이산화의 잡음이 충전율의 효과와 섞인다 (같은 계산을 조각 모델로 하면
-    최적값은 0.45 로 비슷하게 나오지만 곡선이 요동친다).  조각·구슬 모델은
-    던지기 하나를 자세히 확인할 때 쓰는 것이 맞다.
-    """
-    p = resolve_parameters(params, **overrides)
-    if fractions is None:
-        fractions = np.round(np.arange(0.05, 0.76, 0.05), 3)
-    fractions = np.asarray(fractions, dtype=float)
-    if speeds is None:
-        speeds = np.array([2.5, 3.0, 3.5, 4.0])
-    speeds = np.atleast_1d(np.asarray(speeds, dtype=float))
-
-    width = np.zeros((fractions.size, speeds.size))
-    center = np.full((fractions.size, speeds.size), np.nan)
-    slowdown = np.full(fractions.size, np.nan)
-
-    step = 0
-    total_steps = fractions.size * speeds.size
-    for i, fraction in enumerate(fractions):
-        case = p.replace(water_mass=fraction * p.water_mass_max)
-        for a, speed in enumerate(speeds):
-            found = standing_window(case, target=target,
-                                    launch_speed=float(speed))
-            width[i, a] = found["width"]
-            if found["center"] is not None:
-                center[i, a] = found["center"]
-            step += 1
-            if progress is not None:
-                progress(step, total_steps)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            reference = run(case)
-        slowdown[i] = reference["omega"][-1] / reference["omega"][0]
-
-    best_width = width.max(axis=1)
-    d_speed = float(np.mean(np.diff(speeds))) if speeds.size > 1 else 1.0
-    basin = width.sum(axis=1) * d_speed
-    # 성공한 격자점이 하나도 없는 줄에서 nanmax 는 경고와 NaN 을 낸다.
-    useful = (width > 0) & np.isfinite(center)
-    ratio = np.where(useful, width / np.where(useful, center, 1.0), 0.0)
-    relative = ratio.max(axis=1)
-
-    # 어떤 충전율에서도 서지 않으면 "최적값" 이라는 것이 없다. 그때 argmax 는
-    # 첫 번째 칸을 가리키는데, 그것을 답으로 내놓으면 거짓말이 된다.
-    stands_somewhere = bool(np.any(basin > 0))
-    best = float(fractions[int(np.argmax(basin))]) if stands_somewhere else None
-
-    return {"parameters": p, "fractions": fractions, "speeds": speeds,
-            "width": width, "center": center, "best_width": best_width,
-            "relative": relative, "basin": basin, "slowdown": slowdown,
-            "target": target, "any_stands": stands_somewhere,
-            "best_fraction": best}
-
-
-def format_tolerance(scan):
-    """:func:`tolerance_scan` 의 결과를 표로.
-
-    The tolerance scan as a table.
-    """
-    p = scan["parameters"]
-    lines = ["충전율별 성공 범위 / how forgiving each filling fraction is",
-             "병 %.0f mL, %.1f 바퀴 던지기, 던짐 속도 %s m/s"
-             % (1e6 * p.bottle_volume, scan["target"],
-                ", ".join("%.1f" % s for s in scan["speeds"])),
-             "물의 결합도 water_coupling = %.2f (착지 모델의 유일한 가정)"
-             % p.water_coupling,
-             "",
-             "%8s %9s %11s %10s %11s %10s"
-             % ("충전율", "액체[kg]", "성공 폭", "상대 폭", "알맞은 ω",
-                "ω 감속")]
-    for i, fraction in enumerate(scan["fractions"]):
-        centers = scan["center"][i]
-        nominal = np.nanmean(centers) if np.any(np.isfinite(centers)) else np.nan
-        lines.append("%8.2f %9.3f %9.3f   %8.2f%% %10.1f %10.2fx"
-                     % (fraction, fraction * p.water_mass_max,
-                        scan["best_width"][i], 100 * scan["relative"][i],
-                        nominal, scan["slowdown"][i]))
-    lines.append("")
-    lines.append("성공 폭 [rad/s] = 병이 서는 초기 각속도의 폭. 이분법으로 "
-                 "경계를 찾으므로 격자 간격에 좌우되지 않는다.")
-    if scan["best_fraction"] is None:
-        lines.append("어떤 충전율에서도 서지 않았다 / no filling fraction "
-                     "stands under these settings — 던짐 속도 범위를 넓히거나 "
-                     "water_coupling 을 낮춰 보라")
-    else:
-        lines.append("가장 넓은 충전율 / widest at: %.2f"
-                     % scan["best_fraction"])
-        good = scan["fractions"][scan["basin"] >= 0.5 * scan["basin"].max()]
-        if good.size:
-            lines.append("최대의 절반 이상 / at least half the best: "
-                         "%.2f ~ %.2f" % (good.min(), good.max()))
-    lines.append("")
-    lines.append("주의: 거의 가득 찬 병일수록 물이 움직일 빈 공간이 없어 "
-                 "실제로는 굳은 물체에 가까워진다 (water_coupling 이 1 에 "
-                 "가까워진다). 이 계산은 결합도를 일정하게 두므로 높은 "
-                 "충전율 쪽을 실제보다 후하게 본다 — 참 최적값은 여기 나온 "
-                 "값이거나 그보다 조금 낮다.")
-    return "\n".join(lines)
-
-
-def coupling_sensitivity(params=None, couplings=(0.0, 0.1, 0.2, 0.35, 0.6),
-                         **kwargs):
-    """착지 모델의 유일한 가정을 흔들어 결론이 움직이는지 본다.
-
-    Vary the one fitted assumption of the landing model and see if the answer moves.
-
-    ``water_coupling`` 은 계산이 아니라 모델의 선택이다.  그러므로 결론을
-    말하기 전에, 그 값을 바꿔도 **최적 충전율이 그대로인지** 확인해야 한다.
-    성공률의 절대값은 당연히 달라지지만, 최적점이 움직이지 않는다면 결론은
-    이 가정에 기대고 있지 않다.
-    """
-    p = resolve_parameters(params)
-    rows = []
-    for coupling in couplings:
-        scan = tolerance_scan(p.replace(water_coupling=coupling), **kwargs)
-        rows.append({"coupling": coupling,
-                     "best_fraction": scan["best_fraction"],
-                     "basin": scan["basin"],
-                     "fractions": scan["fractions"]})
-    return {"rows": rows}
-
-
-def format_coupling_sensitivity(sensitivity):
-    """:func:`coupling_sensitivity` 의 결과를 표로."""
-    lines = ["착지 가정에 대한 민감도 / sensitivity to the landing assumption",
-             "", "%14s %16s   %s" % ("water_coupling", "최적 충전율",
-                                     "충전율별 성공 폭 (최대=100)")]
-    for row in sensitivity["rows"]:
-        if row["best_fraction"] is None:
-            lines.append("%14.2f %16s   %s"
-                         % (row["coupling"], "-",
-                            "이 결합도에서는 아무 충전율도 서지 않는다"))
-            continue
-        peak = max(row["basin"].max(), 1e-30)
-        shape = " ".join("%3.0f" % (100 * b / peak) for b in row["basin"])
-        lines.append("%14.2f %16.2f   %s" % (row["coupling"],
-                                             row["best_fraction"], shape))
-    bests = [row["best_fraction"] for row in sensitivity["rows"]
-             if row["best_fraction"] is not None]
-    lines.append("")
-    if bests:
-        lines.append("최적 충전율의 범위 / the optimum moves between %.2f and "
-                     "%.2f" % (min(bests), max(bests)))
-        lines.append("이 폭이 좁으면, 결론은 water_coupling 이라는 가정에 "
-                     "기대고 있지 않다는 뜻이다.")
-    else:
-        lines.append("어느 결합도에서도 서지 않았다 / nothing stands at any "
-                     "coupling here")
-    return "\n".join(lines)
-
-
-def substance_scan(params=None, fraction=0.35, densities=None,
-                   viscosities=None, light_bottle=True, **overrides):
-    """충전율을 고정한 채 액체의 종류(밀도·점성)만 바꾼다.
-
-    Hold the filling fraction and change only what the liquid is.
-
-    "물질의 종류나 질량과 무관하고 부피 비율에만 관계된다" 는 가설을 그대로
-    검사한다.  같은 부피 비율에서 밀도를 바꾸면 액체의 질량이 달라지므로
-    ``epsilon`` 이 달라진다 — 결과가 움직인다면 그 통로로 움직인 것이다.
-    ``light_bottle`` 을 켜면 병을 아주 가볍게 한 경우도 함께 계산하는데,
-    거기서는 ``epsilon`` 이 어느 액체에서나 0 에 가까우므로 가설대로 결과가
-    한 점에 모여야 한다.  모이면 가설이 맞고, 갈라지면 통로가 하나 더 있다.
-    """
-    p = resolve_parameters(params, **overrides)
-    if densities is None:
-        densities = [(600.0, "가벼운 기름 / light oil"),
-                     (789.0, "에탄올 / ethanol"),
-                     (1000.0, "물 / water"),
-                     (1260.0, "글리세린 / glycerol"),
-                     (1600.0, "모래 / dry sand")]
-    if viscosities is None:
-        viscosities = {}
-
-    rows = []
-    for entry in densities:
-        density, label = entry if isinstance(entry, tuple) else (entry, "")
-        case = p.replace(water_density=density,
-                         kinematic_viscosity=viscosities.get(
-                             density, p.kinematic_viscosity))
-        case = case.replace(water_mass=fraction * case.water_mass_max)
-        variants = [("보통 병 / real bottle", case)]
-        if light_bottle:
-            variants.append(("가벼운 병 / massless bottle",
-                             case.replace(bottle_mass=1e-4)))
-        for variant, cfg in variants:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                results = run(cfg)
-            out = landing_outcome(results)
-            rows.append({"density": density, "label": label,
-                         "variant": variant, "mass": cfg.water_mass,
-                         "epsilon": cfg.epsilon, "tau": cfg.tau,
-                         "turns": out["turns"], "tilt": out["tilt_deg"],
-                         "slowdown": results["omega"][-1] / results["omega"][0],
-                         "stands": out["stands"]})
-    return {"parameters": p, "fraction": fraction, "rows": rows}
-
-
-def format_substance(scan):
-    """:func:`substance_scan` 의 결과를 표로.
-
-    The substance scan as a table.
-    """
-    lines = ["같은 충전율 %.2f, 액체만 바꿈 / same filling fraction, "
-             "different liquid" % scan["fraction"], "",
-             "%-26s %8s %8s %8s %8s %8s"
-             % ("액체 / liquid", "밀도", "질량[kg]", "epsilon", "회전수",
-                "감속")]
-    for variant in dict.fromkeys(row["variant"] for row in scan["rows"]):
-        lines.append("[%s]" % variant)
-        turns = []
-        for row in scan["rows"]:
-            if row["variant"] != variant:
-                continue
-            turns.append(row["turns"])
-            lines.append("  %-24s %8.0f %8.3f %8.3f %8.3f %7.2fx"
-                         % (row["label"] or "-", row["density"], row["mass"],
-                            row["epsilon"], row["turns"], row["slowdown"]))
-        if turns:
-            spread = max(turns) - min(turns)
-            lines.append("  -> 회전수 편차 / spread in turns: %.4f (%.1f%%)"
-                         % (spread, 100 * spread / max(np.mean(turns), 1e-12)))
-    lines.append("")
-    lines.append("액체의 종류가 결과에 들어오는 통로는 epsilon 과 tau 뿐이다. "
-                 "병을 가볍게 하면 epsilon 이 사라지고, 그러면 밀도가 달라도 "
-                 "결과가 한 점에 모인다 — 그것이 가설이 참인 조건이다.")
-    return "\n".join(lines)
 
 
 def pyplot(show=False):
@@ -3900,8 +3204,10 @@ def figure_slices(results, plt=None):
 
     fig, ax = plt.subplots(4, 1, figsize=(6, 11), sharex=True)
 
-    ax[0].plot(t, results["theta"] / (2 * np.pi))
-    ax[0].set_ylabel("Rotation [turns]")
+    # 놓은 순간부터 몇 바퀴 돌았는가. theta 자체는 연직에서 잰 절대 자세라
+    # 뚜껑을 아래로 놓으면 0.5 바퀴에서 시작해 읽기 나쁘다.
+    ax[0].plot(t, (results["theta"] - results["theta"][0]) / (2 * np.pi))
+    ax[0].set_ylabel("Rotation since release [turns]")
 
     ax[1].plot(t, results["center_of_mass"], "--", lw=2,
                label="centre of mass")
@@ -4046,41 +3352,6 @@ def figure_beads(results, plt=None):
     return fig
 
 
-def figure_tolerance(scan, plt=None):
-    """충전율별 성공률과, 성공하는 던지기의 지도.
-
-    Success rate against filling fraction, and the map of throws that stand.
-    """
-    if plt is None:
-        plt = pyplot()
-    fig, (ax_rate, ax_map) = plt.subplots(1, 2, figsize=(11, 4.2))
-
-    fractions = scan["fractions"]
-    ax_rate.plot(fractions, scan["best_width"], "o-", color="#1f77b4")
-    ax_rate.axvspan(0.30, 0.40, color="#ff7f0e", alpha=0.15,
-                    label="0.30 - 0.40")
-    if scan["best_fraction"] is not None:
-        ax_rate.axvline(scan["best_fraction"], color="#d62728", lw=1,
-                        ls="--", label="widest %.2f" % scan["best_fraction"])
-    ax_rate.set_xlabel("filling fraction")
-    ax_rate.set_ylabel(r"width of throws that stand [rad/s]")
-    ax_rate.set_ylim(0, None)
-    ax_rate.legend(fontsize=8)
-    ax_rate.grid(alpha=0.3)
-
-    # 던짐 속도(=비행 시간)마다 폭이 어떻게 달라지는지
-    for a, speed in enumerate(scan["speeds"]):
-        ax_map.plot(fractions, scan["width"][:, a], "o-", ms=3,
-                    label="%.1f m/s" % speed)
-    ax_map.set_xlabel("filling fraction")
-    ax_map.set_ylabel(r"width of throws that stand [rad/s]")
-    ax_map.set_ylim(0, None)
-    ax_map.legend(fontsize=8, title="launch speed")
-    ax_map.grid(alpha=0.3)
-    fig.tight_layout()
-    return fig
-
-
 def figure(results, plt=None):
     """그 계산의 모델에 맞는 그림을, 간직할 호출자에게 돌려준다.
 
@@ -4122,7 +3393,7 @@ def run_interactive(base=None, ask=input, echo=print, show=True, path=None,
                     progress=None):
     """물리량을 하나씩 묻고, 던지고, 결과를 보여 준다.
 
-    Ask for every physical quantity, run the flip and show the result.
+    Ask for every physical quantity, run the drop and show the result.
     """
     params = prompt_parameters(base, ask=ask, echo=echo)
     results = run(params, progress=progress)
@@ -4139,7 +3410,7 @@ def build_parser():
     """
     parser = argparse.ArgumentParser(
         prog="물병던지기_시뮤레이션.py",
-        description="물병던지기 시뮤레이션 — water bottle flip simulation",
+        description="물병 낙하 시뮤레이션 — falling water bottle simulation",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     add_arguments(parser)
     output = parser.add_argument_group("출력 / output")
@@ -4152,12 +3423,6 @@ def build_parser():
                         help="with --ui, publish a temporary public link")
     output.add_argument("--describe", action="store_true",
                         help="print the parameters and exit without running")
-    output.add_argument("--research", action="store_true",
-                        help="answer the research questions instead of running "
-                             "one throw: which filling fraction stands most "
-                             "often, and whether the liquid itself matters")
-    output.add_argument("--thorough", action="store_true",
-                        help="with --research, use a fine grid (minutes)")
     output.add_argument("--save-figure", metavar="PATH", default=None)
     output.add_argument("--save-data", metavar="PATH", default=None)
     output.add_argument("--no-plot", action="store_true")
@@ -4232,8 +3497,6 @@ def main(argv=None):
     if args.describe:
         print(params.describe())
         return params
-    if args.research:
-        return research_summary(params, quick=not args.thorough)
 
     if args.interactive:
         return run_interactive(params, show=not args.no_plot,
@@ -4261,27 +3524,27 @@ def main(argv=None):
 # ===========================================================================
 # Gradio UI — 물리량 입력 · 버튼 · 그래프 / sliders, buttons and figures
 # ===========================================================================
-# 브라우저 화면 — 물리량을 넣고, 버튼을 누르고, 뒤집기를 본다.
+# 브라우저 화면 — 물리량을 넣고, 버튼을 누르고, 낙하를 본다.
 #
 # :class:`Parameters` 의 물리량마다 컨트롤이 하나씩 생긴다(숫자는 슬라이더,
 # 스위치는 체크박스, 모델은 드롭다운, 낙하 높이는 숫자 상자). 콜백은 컨트롤
 # 값만 받는 보통 함수이므로 브라우저 없이도 시험할 수 있고, ``gradio`` 는
 # 화면을 만들 때에만 가져온다.
 #
-# A Gradio front end: type the physical quantities, press a button, see the flip.
+# A Gradio front end: type the physical quantities, press a button, see the fall.
 #
 # Every quantity of :class:`Parameters` gets a control — a slider for
 # the numeric ones (with the bounds carried in the field metadata), a checkbox
 # for the switches, a dropdown for the model, a number box for the optional drop
 # height — and five buttons act on them:
 #
-# * **실행 / Run** — one flip: the figure of the selected model and a text summary;
+# * **실행 / Run** — one drop: the figure of the selected model and a text summary;
 # * **기본값 / Reset** — put every control back to its default;
-# * **충전율 스캔 / Filling scan** — the same throw at five water masses, so the
+# * **충전율 스캔 / Filling scan** — the same drop at several water masses, so the
 #   degenerate regime and the useful 0.2-0.4 band are visible at once;
 # * **항별 비교 / Force comparison** — the parcel model with the Coriolis force,
 #   the Euler force and the incompressibility constraint switched off in turn;
-# * **모델 비교 / Compare models** — the same throw through all three
+# * **모델 비교 / Compare models** — the same drop through all three
 #   discretisations of the water, which is the only way to see whether they
 #   agree;
 # * **CSV 저장 / Save CSV** — the time series of the current run as a file.
@@ -4298,11 +3561,15 @@ def main(argv=None):
 # 컨트롤 순서, 따라서 콜백 인자 순서는 필드 목록 순서를 따른다.
 UI_FIELDS = [name for _, names in FIELD_GROUPS for name in names]
 
-INTRO = """# 물병던지기 시뮤레이션 — water bottle flip
+INTRO = """# 물병 낙하 시뮤레이션 — falling water bottle
 
-물이 든 병을 회전시켜 자유낙하시키면, 물이 재분포하면서 관성모멘트 `J` 가 커집니다.
-자유비행 중에는 각운동량 `L = J ω` 가 보존되므로 각속도 `ω` 가 떨어지고, 그래서 병이
-똑바로 착지할 수 있습니다.
+물이 든 병을 **뚜껑이 아래로 가게 잡고, 천천히 밀면서 높은 곳에서 놓습니다.**
+떨어지는 동안 물이 재분포하면서 관성모멘트 `J` 가 커지고, 자유낙하 중에는 각운동량
+`L = J ω + L_상대` 가 보존되므로 각속도 `ω` 가 떨어집니다. 이 코드가 재는 것이
+`J(t)`, `ω(t)`, 자세 `θ(t)` 입니다.
+
+낙하 시간은 **낙하 높이** 하나가 정합니다 (`t = √(2h/g)`). 착지는 계산하지
+않습니다 — 바닥에 닿는 순간에 계산이 끝납니다.
 
 왼쪽에서 **물리량을 직접 입력**하고 버튼을 누르세요. 물을 보는 방식이 세 가지입니다.
 
@@ -4314,9 +3581,14 @@ INTRO = """# 물병던지기 시뮤레이션 — water bottle flip
 
 「모델 비교」 버튼으로 세 모델이 같은 답을 주는지 확인할 수 있습니다.
 
-충전율이 0.1 아래면 물기둥 전체가 질량중심 한쪽에 놓여 재분포가 일어나지 않습니다.
-0.2~0.4 에서 감속이 가장 큽니다. 스캔과 항별 비교는 여러 번 계산하므로 몇십 초가
-걸릴 수 있습니다.
+충전율이 낮으면 물기둥 전체가 질량중심 한쪽에 놓여 재분포가 아예 일어나지 않고,
+그때는 `ω` 가 그대로입니다 (요약에 경고가 붙습니다). 스캔과 항별 비교는 여러 번
+계산하므로 몇십 초가 걸릴 수 있습니다.
+
+**밀어 주는 세기**: 던지는 것이 아니므로 `ω₀` 는 몇 rad/s 정도로 작습니다. 다만
+원심력이 `ω²` 에 비례하므로, 너무 작으면 낙하 시간 안에 물이 거의 움직이지 않아
+`J` 가 변하지 않습니다. 높이와 `ω₀` 를 바꿔 가며 효과가 보이는 범위를 먼저 잡아
+보세요.
 
 **큰 계산**: 구슬 수나 조각 수를 크게 올리면 오래 걸리지만 끝까지 갑니다. 병에
 들어가지 않는 구슬 크기, 너무 굵은 조각, 메모리를 넘는 이력은 자동으로 조정하고
@@ -4324,16 +3596,16 @@ INTRO = """# 물병던지기 시뮤레이션 — water bottle flip
 
 PRESETS = [
     # 병 높이, 반지름, 빈 병 질량, 물 질량, 초기 각속도, 모델, 조각 수
-    ("500 mL 생수병 / default", 0.21, 0.031, 0.022, 0.17, 23.0, "slices", 19),
-    ("적게 채움 15% / underfilled", 0.21, 0.031, 0.022, 0.076, 23.0, "slices",
+    ("500 mL 생수병 / default", 0.21, 0.031, 0.022, 0.17, 5.0, "slices", 19),
+    ("적게 채움 15% / underfilled", 0.21, 0.031, 0.022, 0.076, 5.0, "slices",
      19),
-    ("많이 채움 60% / overfilled", 0.21, 0.031, 0.022, 0.305, 23.0, "slices",
+    ("많이 채움 60% / overfilled", 0.21, 0.031, 0.022, 0.305, 5.0, "slices",
      19),
-    ("단면 분해 / cross section resolved", 0.21, 0.031, 0.022, 0.17, 23.0,
+    ("세게 밀어서 / a firmer push", 0.21, 0.031, 0.022, 0.17, 12.0, "slices",
+     19),
+    ("단면 분해 / cross section resolved", 0.21, 0.031, 0.022, 0.17, 5.0,
      "parcels", 19),
-    ("구슬 / beads (forces)", 0.21, 0.031, 0.022, 0.17, 23.0, "beads", 19),
-    ("1.5 L 큰 병 / large bottle", 0.31, 0.044, 0.038, 0.50, 18.0, "slices",
-     19),
+    ("구슬 / beads (forces)", 0.21, 0.031, 0.022, 0.17, 5.0, "beads", 19),
 ]
 
 
@@ -4397,7 +3669,7 @@ def _run_capturing_warnings(params):
 def run_and_render(*values):
     """한 번 던지고 ``(그림, 요약 글)`` 을 돌려준다.
 
-    Run one flip and return ``(figure, summary text)``.
+    Run one drop and return ``(figure, summary text)``.
     """
     try:
         params = parameters_from_values(values)
@@ -4414,9 +3686,9 @@ def run_and_render(*values):
 
 def filling_scan(*values, fractions=(0.05, 0.15, 0.25, 0.35, 0.45, 0.55,
                                      0.65)):
-    """같은 던지기를 여러 충전율에서 되풀이한다.
+    """같은 낙하를 여러 충전율에서 되풀이한다.
 
-    Repeat the same throw at several filling fractions.
+    Repeat the same drop at several filling fractions.
     """
     try:
         params = parameters_from_values(values)
@@ -4427,7 +3699,7 @@ def filling_scan(*values, fractions=(0.05, 0.15, 0.25, 0.35, 0.45, 0.55,
     plt = pyplot()
     fig, (ax_omega, ax_inertia) = plt.subplots(1, 2, figsize=(10, 4))
     lines = ["충전율 스캔 / filling fraction scan "
-             "(같은 병, 같은 던지기 / same bottle and throw)", "",
+             "(같은 병, 같은 낙하 / same bottle and drop)", "",
              "%9s %9s %10s %11s %9s" % ("물 [kg]", "충전율", "J 증가",
                                         "최종 ω", "회전수")]
     for fraction in fractions:
@@ -4459,54 +3731,6 @@ def filling_scan(*values, fractions=(0.05, 0.15, 0.25, 0.35, 0.45, 0.55,
     lines.append("물이 적으면 물기둥이 질량중심 한쪽에만 놓여 재분포가 일어나지 "
                  "않습니다.")
     return fig, "\n".join(lines)
-
-
-def tolerance_render(*values):
-    """UI 버튼용: 충전율별 성공 범위를 계산해 그림과 표로.
-
-    UI entry point for :func:`tolerance_scan`.
-    """
-    try:
-        params = parameters_from_values(values)
-    except (ValueError, TypeError) as error:
-        return (_blank_figure("invalid input - see the summary"),
-                "입력 오류 / invalid input:\n%s" % error)
-    # 화면에서 누르는 것이므로 격자를 성기게 잡는다. 연구용으로 촘촘히
-    # 훑으려면 코드에서 tolerance_scan(omega=..., speeds=...) 을 직접 부른다.
-    scan = tolerance_scan(params.replace(model="slices", n_slices=60,
-                                         n_steps=200),
-                          fractions=np.round(np.arange(0.05, 0.76, 0.05), 3),
-                          speeds=np.array([2.5, 3.0, 3.5, 4.0]))
-    return figure_tolerance(scan), format_tolerance(scan)
-
-
-def substance_render(*values):
-    """UI 버튼용: 같은 충전율에서 액체만 바꿔 본다.
-
-    UI entry point for :func:`substance_scan`.
-    """
-    try:
-        params = parameters_from_values(values)
-    except (ValueError, TypeError) as error:
-        return (_blank_figure("invalid input - see the summary"),
-                "입력 오류 / invalid input:\n%s" % error)
-    fraction = params.filling_fraction
-    scan = substance_scan(params.replace(model="slices"), fraction=fraction)
-
-    plt = pyplot()
-    fig, ax = plt.subplots(figsize=(7, 4))
-    for variant in dict.fromkeys(row["variant"] for row in scan["rows"]):
-        rows = [row for row in scan["rows"] if row["variant"] == variant]
-        ax.plot([row["density"] for row in rows],
-                [row["turns"] for row in rows], "o-",
-                label="real bottle" if "보통" in variant else "massless bottle")
-    ax.set_xlabel(r"liquid density [kg/m$^3$]")
-    ax.set_ylabel("turns in flight")
-    ax.set_title("same filling fraction %.2f, different liquid" % fraction)
-    ax.legend(fontsize=8)
-    ax.grid(alpha=0.3)
-    fig.tight_layout()
-    return fig, format_substance(scan)
 
 
 def force_comparison(*values):
@@ -4557,9 +3781,9 @@ def force_comparison(*values):
 
 
 def compare_models(*values):
-    """같은 던지기를 세 모델로 모두 돌려 견주어 본다.
+    """같은 낙하를 세 모델로 모두 돌려 견주어 본다.
 
-    Run the same throw through all three models and compare them.
+    Run the same drop through all three models and compare them.
 
     What is comparable is how much the moment of inertia grows and where the
     rotation ends up.  Its absolute value is not: each model starts from a
@@ -4573,7 +3797,7 @@ def compare_models(*values):
 
     plt = pyplot()
     fig, (ax_omega, ax_inertia) = plt.subplots(1, 2, figsize=(10, 4))
-    lines = ["모델 비교 / the same throw through all three models", "",
+    lines = ["모델 비교 / the same drop through all three models", "",
              "%-26s %9s %9s %10s %9s" % ("모델", "J 처음", "J 증가", "최종 ω",
                                          "회전수")]
     labels = {"slices": "원판 / discs", "parcels": "입자 / parcels",
@@ -4682,10 +3906,6 @@ def build_interface():
                     forces_button = gr.Button("항별 비교 / Force comparison")
                     compare_button = gr.Button("모델 비교 / Compare models")
                     csv_button = gr.Button("CSV 저장 / Save CSV")
-                with gr.Row():
-                    tolerance_button = gr.Button(
-                        "성공 범위 / Success basin", variant="primary")
-                    substance_button = gr.Button("액체 바꾸기 / Change liquid")
                 plot_output = gr.Plot(label="그래프 / figure")
                 # 고정폭 블록: 요약은 열을 맞춘 표다
                 text_output = gr.Code(label="요약 / summary", language=None,
@@ -4702,14 +3922,10 @@ def build_interface():
         compare_button.click(compare_models, inputs=ordered,
                              outputs=[plot_output, text_output])
         csv_button.click(save_csv, inputs=ordered, outputs=file_output)
-        tolerance_button.click(tolerance_render, inputs=ordered,
-                               outputs=[plot_output, text_output])
-        substance_button.click(substance_render, inputs=ordered,
-                               outputs=[plot_output, text_output])
         reset_button.click(lambda: default_values(), inputs=None,
                            outputs=ordered)
         # 열자마자 결과가 보이게 한다. 처음 온 사람이 빈 화면이 아니라
-        # 뒤집기를 먼저 보도록.
+        # 낙하를 먼저 보도록.
         demo.load(run_and_render, inputs=ordered,
                   outputs=[plot_output, text_output])
 
