@@ -63,6 +63,33 @@ PR_VMAX      = 5.0       # PR 속도 성분 정규화 기준
 PR_WD, PR_WV = 0.6, 0.4  # PR 내부 가중치 (거리 : 접근속도). 검증 전 초기 가설
 W_SC, W_PR   = 0.5, 0.5  # DPI 합성 가중치. 선험적 근거가 없으므로 동일하게 둔다
 
+# ── TC : SC + PR + PA 총 기여도 ─────────────────────────────────
+W_TC_SC, W_TC_PR, W_TC_PA = 1/3, 1/3, 1/3   # 셋 다 같게. 어느 하나가 더 중요하다는
+                         # 근거가 없고, 순위에 맞춰 조정하면 결론을 먼저 정해 놓고
+                         # 식을 맞추는 것이 된다. 가중치를 바꿨을 때 순위가 얼마나
+                         # 흔들리는지는 실행할 때마다 출력된다.
+TC_NORM      = "rank"    # 세 지표를 합치기 전 같은 자로 맞추는 방법
+                         #   "rank" = 순위를 정규분포 점수로 (분포 모양에 안 휘둘림)
+                         #   "z"    = 평균 0, 표준편차 1
+                         #   SC 는 좌우대칭인데 PR 은 오른쪽으로 길게 늘어져 있다
+                         #   (왜도 +1.2, 최대/중앙 6.5). z 로 더하면 꼬리가 긴 PR 의
+                         #   극단값이 합계를 끌고 가서, 가중치는 1/3 씩인데 실제
+                         #   영향력은 그렇지 않게 된다. 그래서 순위 기반을 기본으로 둔다.
+TC_MIN_FRAMES = 0.2      # 팀 중앙값 대비 이 비율보다 적게 관측된 선수는 순위에서 뺀다.
+                         # 교체 선수처럼 표본이 적으면 평균이 튀는데, 그 값이 정규화
+                         # 기준까지 흔들어 나머지 선수 점수를 바꾼다.
+GK_IDS       = None      # 골키퍼 track_id 목록. None 이면 자동 추정한다.
+GK_MAX_DIST  = 22.0      # 자기 골대까지의 평균거리가 이보다 작은 '팀당 한 명'을
+                         # 골키퍼로 본다 (실측: 골키퍼 ~20 m, 센터백 ~31 m).
+                         #   골키퍼는 위험도 가중치가 최대인 골문 앞에 상시 서 있어서
+                         #   가만히 있어도 SC 를 쓸어담는다 (모사 경기에서 SC 3위/7위).
+                         #   총 기여도 순위에 넣으면 그 자리가 곧 점수가 되므로 뺀다.
+TC_POS_ADJUST = True     # 포지션 보정. 총 기여도를 '자기 골대까지의 평균거리'로
+                         # 회귀해 잔차를 함께 보고한다. SC 는 뒤에 설수록, PR·PA 는
+                         # 앞에 설수록 높아서(실측 ρ=-0.87 / +0.68 / +0.29) 보정 없이는
+                         # 순위가 '어느 자리에서 뛰는가'를 크게 반영한다.
+                         # 보정본은 '같은 위치의 선수들 중에서 얼마나 잘했나' 로 읽는다.
+
 W_LANE       = 3.0       # PA 길목: 패스선에서 이만큼 떨어져야 완전히 열린 것으로 본다 (m)
                          #   기준은 '공이 지나가는 동안 수비수가 닿을 수 있는 폭'이다.
                          #   15 m 패스가 12~15 m/s 로 날아가면 1.0~1.2초가 걸리고, 그 사이
@@ -713,11 +740,16 @@ def sc_shapley(grid, def_xy, att_xy, w):
     return (covers * per[:, None]).sum(axis=0), float(w[ctrl].sum())
 
 
+def own_goals(teams):
+    """각 팀이 지키는(자기) 골대 좌표. 공격 방향 설정 하나에서만 나오게 모아 둔다."""
+    if TEAM_A_ATTACKS_PLUS_X:
+        return {teams[0]: (0.0, PITCH_W / 2), teams[1]: (PITCH_L, PITCH_W / 2)}
+    return {teams[0]: (PITCH_L, PITCH_W / 2), teams[1]: (0.0, PITCH_W / 2)}
+
+
 def calculate_sc(tracks, F, teams):
     grid, area = make_grid()
-    goals = {teams[0]: (0.0, PITCH_W / 2), teams[1]: (PITCH_L, PITCH_W / 2)}
-    if not TEAM_A_ATTACKS_PLUS_X:
-        goals = {teams[0]: (PITCH_L, PITCH_W / 2), teams[1]: (0.0, PITCH_W / 2)}
+    goals = own_goals(teams)
 
     meta = F.set_index("frame")
     rows, t0, n = [], time.perf_counter(), 0
@@ -962,6 +994,27 @@ def metric_report(M, PAdf, agg):
                   f"1.0 포화 {(s >= 0.999).mean()*100:4.1f}% , 0.0 바닥 {(s <= 0.001).mean()*100:4.1f}%")
         print(f"      포화가 절반을 넘으면 그 차원은 순위에 기여하지 못한다 "
               f"(W_LANE={W_LANE}, PA_SPACE_R={PA_SPACE_R} 를 키울 것)")
+    # 분할 재현성 — 앞구간에서 잘 나온 선수가 뒷구간에서도 잘 나오는가.
+    #   같은 선수를 두 번 잰 셈이므로, 순위가 안 맞으면 그 지표는 선수의 성질이
+    #   아니라 그 구간의 상황(공이 어디 있었나)을 재고 있는 것이다.
+    #   짧은 영상에서는 표본이 적어 낮게 나오는 것이 정상이다. 경기 시간을
+    #   늘려도 안 오르면 그때는 지표 문제다.
+    if "frame" in M.columns and len(M):
+        from scipy.stats import spearmanr as _sp
+        half = M["frame"].median()
+        out = []
+        for c in ("SC", "PR", "PA"):
+            if c not in M.columns:
+                continue
+            g1 = M[M.frame <= half].groupby("track_id")[c].mean()
+            g2 = M[M.frame > half].groupby("track_id")[c].mean()
+            j = pd.concat([g1, g2], axis=1).dropna()
+            if len(j) > 3:
+                out.append(f"{c} ρ={_sp(j.iloc[:, 0], j.iloc[:, 1]).statistic:+.3f}")
+        if out:
+            print("  분할 재현성 (앞구간 vs 뒷구간 순위상관): " + " , ".join(out))
+            print("      낮으면 표본이 부족하거나, 선수가 아니라 상황을 재고 있는 것이다")
+
     # 지표가 '어디에 서는 선수인가'로 얼마나 설명되는지
     if len(agg) > 3 and "d_mean" in agg.columns:
         from scipy.stats import spearmanr as _sp
@@ -972,6 +1025,131 @@ def metric_report(M, PAdf, agg):
             if ok.sum() > 3:
                 print(f"  {c:8s} vs 공까지 평균거리 ρ={_sp(s[ok], d[ok]).statistic:+.3f}", end="")
         print("\n      |ρ| 가 1 에 가까우면 그 지표는 능력이 아니라 포지션을 재고 있다")
+
+
+# ══════════════ 5d. TC — SC + PR + PA 총 기여도 ══════════════
+def normalize_scores(s, how=None):
+    """세 지표를 더할 수 있게 같은 자로 맞춘다. 결측은 결측으로 둔다."""
+    how = TC_NORM if how is None else how
+    v = s.dropna()
+    if len(v) < 3:
+        return pd.Series(np.nan, index=s.index, dtype=float)
+    if how == "rank":
+        from scipy.stats import norm
+        out = pd.Series(norm.ppf(v.rank(method="average") / (len(v) + 1)), index=v.index)
+    else:
+        sd = v.std(ddof=0)
+        out = (v - v.mean()) / (sd if sd else 1.0)
+    return out.reindex(s.index)
+
+
+def mean_dist_own_goal(tracks, teams):
+    """선수별 '자기 골대까지의 평균거리'. 포지션 대용으로 쓴다."""
+    g = own_goals(teams)
+    gx = tracks["team"].map({t: g[t][0] for t in teams}).to_numpy(float)
+    gy = tracks["team"].map({t: g[t][1] for t in teams}).to_numpy(float)
+    d = np.hypot(tracks["X"].to_numpy(float) - gx, tracks["Y"].to_numpy(float) - gy)
+    return pd.Series(d, index=tracks.index).groupby(tracks["track_id"]).mean()
+
+
+def detect_goalkeepers(dist_goal, tracks, teams):
+    """팀마다 자기 골대에 가장 붙어 있는 한 명을 골키퍼로 본다."""
+    if GK_IDS is not None:
+        return set(GK_IDS)
+    team_of = tracks.groupby("track_id")["team"].first()
+    gks = set()
+    for t in teams:
+        s = dist_goal[team_of.reindex(dist_goal.index).to_numpy() == t]
+        if len(s) and s.min() < GK_MAX_DIST:
+            gks.add(s.idxmin())
+    return gks
+
+
+def total_contribution(agg, tracks, teams):
+    """
+    SC · PR · PA 를 하나로 합친 총 기여도.
+
+        TC = w1·n(SC) + w2·n(PR) + w3·n(PA)          n() = 순위 정규화
+
+    세 지표는 단위도 분포도 다르고(SC 는 위험도 가중 면적, PR·PA 는 0~1),
+    나오는 프레임도 다르다(SC·PR 은 수비 중, PA 는 공격 중). 그래서 원값을
+    더하는 것은 의미가 없고, 같은 자로 맞춘 뒤에 더해야 한다.
+
+    합치기 전에 두 가지를 뺀다.
+      · 골키퍼 — 위험도가 최대인 골문 앞에 서 있는 것만으로 SC 를 쓸어담는다.
+      · 표본이 너무 적은 선수 — 평균이 튀고, 정규화 기준까지 흔들어 남의
+        점수를 바꾼다.
+
+    그리고 TC 는 '어느 자리에서 뛰는가'와 상관이 크다(SC 는 뒤에 설수록,
+    PR·PA 는 앞에 설수록 높다). 그래서 자기 골대까지의 평균거리로 회귀한
+    잔차 TC_adj 를 같이 낸다. TC 는 '팀에 준 총량', TC_adj 는 '같은 위치의
+    선수들과 비교했을 때'로 읽어야 한다. 둘 중 하나가 정답이 아니라, 둘이
+    많이 다르면 그 순위는 포지션이 만든 것이라는 뜻이다.
+    """
+    a = agg.copy()
+    dist_goal = mean_dist_own_goal(tracks, teams)
+    gks = detect_goalkeepers(dist_goal, tracks, teams)
+    a["dist_own_goal"] = dist_goal.reindex(a.index).round(1)
+    a["is_gk"] = a.index.isin(gks)
+
+    seen = a.get("frames", pd.Series(0, index=a.index)).fillna(0) \
+           + a.get("PA_frames", pd.Series(0, index=a.index)).fillna(0)
+    thin = seen < TC_MIN_FRAMES * seen.median()
+    use = ~a["is_gk"] & ~thin
+
+    cols = {"SC_mean": W_TC_SC, "PR_mean": W_TC_PR, "PA_mean": W_TC_PA}
+    have = [c for c in cols if c in a.columns]
+    norm = {c: normalize_scores(a[c].where(use)) for c in have}
+    for c in have:
+        a[c.replace("_mean", "_n")] = norm[c].round(4)
+    if len(have) == 3:
+        a["TC"] = sum(norm[c] * cols[c] for c in have).round(4)
+    else:
+        a["TC"] = np.nan
+
+    print(f"\n[총 기여도]  TC = {W_TC_SC:.2f}·n(SC) + {W_TC_PR:.2f}·n(PR) + "
+          f"{W_TC_PA:.2f}·n(PA)   n() = {TC_NORM} 정규화")
+    if gks:
+        print(f"           골키퍼로 보고 제외: {sorted(gks)} "
+              f"(자기 골대까지 평균 {dist_goal[list(gks)].mean():.1f} m)")
+    if thin.any():
+        print(f"           표본 부족으로 제외: {list(a.index[thin])}")
+    miss = use & a["TC"].isna()
+    if miss.any():
+        print(f"           세 지표가 다 있지는 않아 TC 를 못 낸 선수: {list(a.index[miss])}")
+
+    if TC_POS_ADJUST:
+        m = a["TC"].notna() & a["dist_own_goal"].notna()
+        if m.sum() >= 5:
+            x = a.loc[m, "dist_own_goal"].to_numpy(float)
+            y = a.loc[m, "TC"].to_numpy(float)
+            b1, b0 = np.polyfit(x, y, 1)
+            fit = b0 + b1 * x
+            ss = ((y - y.mean()) ** 2).sum()
+            r2 = 1 - ((y - fit) ** 2).sum() / ss if ss > 0 else 0.0
+            a.loc[m, "TC_adj"] = np.round(y - fit, 4)
+            print(f"           TC 의 {r2*100:.0f}% 가 '자기 골대까지의 거리' 하나로 설명된다"
+                  f" -> 포지션 보정본 TC_adj 를 같이 본다")
+            if r2 > 0.4:
+                print("           ! 절반 가까이가 포지션이다. TC 순위를 '누가 더 잘했나'로"
+                      " 읽으면 안 되고, TC_adj 와 함께 봐야 한다.")
+
+    if a["TC"].notna().sum() > 3:
+        from scipy.stats import spearmanr as _sp
+        base = a["TC"].dropna()
+        worst, arg = 1.0, None
+        for w in [(1, 0, 0), (0, 1, 0), (0, 0, 1), (.5, .5, 0), (.5, 0, .5), (0, .5, .5)]:
+            alt = sum(norm[c] * wi for c, wi in zip(["SC_mean", "PR_mean", "PA_mean"], w))
+            alt = alt.reindex(base.index).dropna()
+            if len(alt) > 3:
+                r = _sp(base.reindex(alt.index), alt).statistic
+                if r < worst:
+                    worst, arg = r, w
+        print(f"           가중치를 바꿨을 때 순위 상관 최소 ρ={worst:.3f} (가중치 {arg} 일 때)")
+        if worst < 0.5:
+            print("           ! 가중치가 순위를 지배한다. 1/3 씩은 '검증 전 기준선'일 뿐이고,"
+                  " 결과 라벨(승패·득점 등)이 생기면 반드시 다시 정할 것.")
+    return a
 
 
 # ══════════════ 6. 자체 검증 ══════════════
@@ -1130,7 +1308,8 @@ def main():
         agg["DPI"] = (W_SC * agg.SC_z + W_PR * agg.PR_z).round(4)
     if "PA_z" in agg.columns:
         agg["PA_index"] = agg.PA_z.round(4)
-    agg = agg.sort_values("DPI", ascending=False)
+    agg = total_contribution(agg, L1, teams)
+    agg = agg.sort_values("TC" if agg["TC"].notna().any() else "DPI", ascending=False)
 
     print(f"\n[선수별 결과]  DPI = {W_SC}·z(SC) + {W_PR}·z(PR)  (수비)  /  PA_index (공격)")
     if {"SC_z", "PR_z"} <= set(agg.columns) and len(agg) > 3:
