@@ -58,6 +58,7 @@ References
 import argparse
 import builtins
 import dataclasses
+import functools
 import math
 import os
 import sys
@@ -87,20 +88,201 @@ import numpy as np
 # All quantities are in SI units.
 
 # --- Bottle geometry and mass ---
-BOTTLE_HEIGHT = 0.28  # Height of the bottle, unit: m
-BOTTLE_RADIUS = 0.04  # Radius of the bottle, unit: m
-BOTTLE_MASS = 0.028  # Mass of the empty bottle, unit: kg
+# 기본값은 실제로 사람들이 던지는 병 — 500 mL PET 생수병이다.  예전 기본값
+# (높이 0.28 m, 반지름 0.04 m)은 부피가 1.4 L 로, 물병던지기 실험에서 쓰는
+# 병이 아니었다.  충전율의 최적값을 묻는 연구라면 병의 모양이 곧 답의 일부이므로
+# 기본 병을 실제 병으로 바꾼다.
+BOTTLE_HEIGHT = 0.21  # Height of the bottle, unit: m
+BOTTLE_RADIUS = 0.031  # Radius of the cylindrical body, unit: m
+BOTTLE_MASS = 0.022  # Mass of the empty bottle (with the cap), unit: kg
+
+# 실제 PET 병은 원통이 아니다. 몸통이 어깨에서 좁아져 목이 되고, 물은 그 목을
+# 통과해야 뚜껑 쪽에 쌓인다.  아래 세 값이 그 모양을 준다 (NECK_RADIUS 를
+# BOTTLE_RADIUS 와 같게 두면 예전처럼 순수한 원통이 된다).
+NECK_RADIUS = 0.0105  # Inner radius at the cap, unit: m
+SHOULDER_START = 0.70  # 어깨가 시작하는 높이 (병 높이에 대한 비율)
+SHOULDER_END = 0.88  # 목 반지름에 도달하는 높이 (병 높이에 대한 비율)
 
 # --- Fluid properties ---
 WATER_DENSITY = 1000.0  # Density of water, unit: kg/m**3
+# 물의 동점성계수 [m**2/s]. 벽 항력의 감쇠 시간을 점성에서 유도할 때 쓴다.
+WATER_KINEMATIC_VISCOSITY = 1.0e-6
 
 # --- Environment ---
 G = 9.81  # Gravity constant on Earth, unit: m/s**2
 
+
+# ===========================================================================
+# 병의 모양 — the shape of a real bottle
+# ===========================================================================
+# 실제 PET 병은 원통이 아니라 "몸통 - 어깨 - 목" 이다.  이 차이는 물병던지기
+# 에서 그냥 넘길 수 있는 세부가 아니다.
+#
+# * 같은 충전율이라도 물기둥의 높이가 달라진다. 부피의 대부분이 몸통에 있으므로
+#   물은 원통일 때보다 낮게 깔린다.
+# * 물이 뚜껑 쪽으로 몰릴 때 목을 지나야 한다. 좁은 목이 물을 붙잡아, 원통
+#   모델이 주는 것보다 물이 덜 퍼진다.
+# * 병 자체의 관성모멘트도 질량이 몸통에 몰려 있어 원통과 다르다.
+#
+# 아래 함수들은 회전체 반지름 ``R(z)`` 와, 그 적분인 누적 부피 ``S(z)`` 와,
+# 그 역함수를 해석적으로 준다.  누적 부피는 물을 "같은 질량의 원판" 으로 나눌
+# 때 결정적이다 — 부피 좌표 ``s = S(z)`` 에서는 원판 하나가 언제나 같은 두께
+# ``V_water / n`` 를 차지하므로, 목에서 원판이 얇아지고 몸통에서 두꺼워지는
+# 것을 따로 다루지 않아도 비압축성 제약이 그대로 성립한다.
+
+def radius_profile(z, radius=BOTTLE_RADIUS, neck=NECK_RADIUS,
+                   height=BOTTLE_HEIGHT, shoulder_start=SHOULDER_START,
+                   shoulder_end=SHOULDER_END):
+    """바닥에서 ``z`` 만큼 올라간 곳의 병 안쪽 반지름 [m].
+
+    Inner radius of the bottle at height ``z`` above the base, unit: m.
+
+    몸통에서는 ``radius``, 어깨에서는 선형으로 좁아지고, 목에서는 ``neck`` 이다.
+    """
+    z = np.asarray(z, dtype=float)
+    z_1 = shoulder_start * height
+    z_2 = shoulder_end * height
+    if z_2 <= z_1:
+        return np.where(z < z_1, radius, neck)
+    t = np.clip((z - z_1) / (z_2 - z_1), 0.0, 1.0)
+    return radius + (neck - radius) * t
+
+
+def cumulative_volume(z, radius=BOTTLE_RADIUS, neck=NECK_RADIUS,
+                      height=BOTTLE_HEIGHT, shoulder_start=SHOULDER_START,
+                      shoulder_end=SHOULDER_END):
+    """바닥에서 ``z`` 까지의 병 내부 부피 [m**3] — 해석적으로.
+
+    Interior volume of the bottle below ``z``, unit: m**3.
+
+    몸통은 원기둥, 어깨는 원뿔대, 목은 다시 원기둥이므로 세 조각을 더하면 된다.
+    """
+    z = np.clip(np.asarray(z, dtype=float), 0.0, height)
+    z_1 = shoulder_start * height
+    z_2 = shoulder_end * height
+
+    body = np.pi * radius ** 2 * np.minimum(z, z_1)
+
+    if z_2 > z_1:
+        slope = (neck - radius) / (z_2 - z_1)
+        z_in = np.clip(z, z_1, z_2)
+        r_in = radius + slope * (z_in - z_1)
+        if abs(slope) > 1e-15:
+            # ∫ pi R(z)**2 dz = pi (R(z)**3 - R_body**3) / (3 slope)
+            shoulder = np.pi * (r_in ** 3 - radius ** 3) / (3 * slope)
+        else:
+            shoulder = np.pi * radius ** 2 * (z_in - z_1)
+    else:
+        shoulder = np.zeros_like(body)
+
+    throat = np.pi * neck ** 2 * np.maximum(z - z_2, 0.0)
+    return body + shoulder + throat
+
+
+def height_at_volume(volume, radius=BOTTLE_RADIUS, neck=NECK_RADIUS,
+                     height=BOTTLE_HEIGHT, shoulder_start=SHOULDER_START,
+                     shoulder_end=SHOULDER_END):
+    """누적 부피 ``S(z) = volume`` 인 높이 ``z`` [m] — :func:`cumulative_volume` 의 역함수.
+
+    Inverse of :func:`cumulative_volume`: the height holding this volume below it.
+    """
+    volume = np.asarray(volume, dtype=float)
+    z_1 = shoulder_start * height
+    z_2 = shoulder_end * height
+    v_body = np.pi * radius ** 2 * z_1
+    if z_2 > z_1:
+        slope = (neck - radius) / (z_2 - z_1)
+        if abs(slope) > 1e-15:
+            v_shoulder = np.pi * (neck ** 3 - radius ** 3) / (3 * slope)
+        else:
+            slope = 0.0
+            v_shoulder = np.pi * radius ** 2 * (z_2 - z_1)
+    else:
+        slope = 0.0
+        v_shoulder = 0.0
+
+    in_body = volume <= v_body
+    in_neck = volume >= v_body + v_shoulder
+
+    z = np.empty_like(volume)
+    # 몸통: 단면이 일정하다
+    z_body = volume / (np.pi * radius ** 2)
+    # 어깨: R**3 이 부피에 선형이다
+    if slope:
+        cube = np.maximum(radius ** 3 + 3 * slope
+                          * (volume - v_body) / np.pi, 0.0)
+        z_shoulder = z_1 + (np.cbrt(cube) - radius) / slope
+    else:
+        z_shoulder = z_1 + (volume - v_body) / (np.pi * radius ** 2)
+    # 목: 다시 단면이 일정하다
+    z_neck = z_2 + (volume - v_body - v_shoulder) / (np.pi * neck ** 2)
+
+    z = np.where(in_body, z_body, np.where(in_neck, z_neck, z_shoulder))
+    return np.clip(z, 0.0, height)
+
+
+def bottle_shell_moments(radius=BOTTLE_RADIUS, neck=NECK_RADIUS,
+                         height=BOTTLE_HEIGHT, shoulder_start=SHOULDER_START,
+                         shoulder_end=SHOULDER_END, samples=2001):
+    """빈 병의 질량이 어떻게 퍼져 있는지 — 단위 질량당 모멘트들.
+
+    Where the mass of the empty bottle sits, as moments per unit mass.
+
+    병의 질량은 벽면 넓이에 비례해 퍼져 있다고 본다 (같은 두께의 껍질).
+    목이 좁으니 거기 있는 질량은 적고, 회전축에서 먼 몸통 벽이 대부분을
+    차지한다 — 균질한 원통 껍질로 놓는 예전 식은 병의 질량중심을 너무 높게,
+    관성모멘트를 몇 % 크게 잡는다.
+
+    Returns ``(z_cm, ring_term, second_moment)`` per unit mass, from which the
+    transverse moment of inertia about any axis follows in closed form::
+
+        J = ring_term + second_moment - 2 z_axis * z_cm + z_axis**2 + y_axis**2
+
+    (all per unit mass, so multiply by the bottle mass).
+    """
+    z = np.linspace(0.0, height, samples)
+    r = radius_profile(z, radius, neck, height, shoulder_start, shoulder_end)
+    slope = np.gradient(r, z)
+    # 회전면의 넓이 요소: 2 pi R sqrt(1 + R'^2) dz. 여기에 바닥과 뚜껑 원판을
+    # 더한다 — 병 질량의 일부는 거기 있고, 바닥은 반지름이 커서 무겁다.
+    weight = 2 * np.pi * r * np.sqrt(1 + slope ** 2)
+
+    integrate = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+    area_wall = float(integrate(weight, z))
+    area_base = np.pi * float(radius_profile(0.0, radius, neck, height,
+                                             shoulder_start, shoulder_end)) ** 2
+    area_cap = np.pi * float(neck) ** 2
+    total = area_wall + area_base + area_cap
+    if total <= 0:
+        return height / 2, radius ** 2 / 2, height ** 2 / 3
+
+    # 벽: 반지름 r 의 고리 하나는 자기 지름축에 대해 m r**2 / 2
+    ring_wall = float(integrate(weight * r ** 2 / 2, z))
+    first_wall = float(integrate(weight * z, z))
+    second_wall = float(integrate(weight * z ** 2, z))
+    # 바닥과 뚜껑: 원판 하나는 자기 지름축에 대해 m R**2 / 4
+    r_base = float(radius_profile(0.0, radius, neck, height,
+                                  shoulder_start, shoulder_end))
+    ring_ends = area_base * r_base ** 2 / 4 + area_cap * neck ** 2 / 4
+    first_ends = area_cap * height
+    second_ends = area_cap * height ** 2
+
+    z_cm = (first_wall + first_ends) / total
+    ring_term = (ring_wall + ring_ends) / total
+    second_moment = (second_wall + second_ends) / total
+    return z_cm, ring_term, second_moment
+
+@functools.lru_cache(maxsize=64)
+def _shell_moments_cached(radius, neck, height, shoulder_start, shoulder_end):
+    """모양이 같으면 :func:`bottle_shell_moments` 를 다시 적분하지 않는다."""
+    return bottle_shell_moments(radius, neck, height, shoulder_start,
+                                shoulder_end)
+
+
 # --- Derived quantities ---
 # 병의 내부 부피, 단위: m**3
-BOTTLE_VOLUME = math.pi * BOTTLE_RADIUS ** 2 * BOTTLE_HEIGHT
-# 병을 가득 채웠을 때의 물 질량, 단위: kg (위 치수라면 약 1.407 kg).
+BOTTLE_VOLUME = float(cumulative_volume(BOTTLE_HEIGHT))
+# 병을 가득 채웠을 때의 물 질량, 단위: kg (위 치수라면 약 0.508 kg).
 # 치수에서 유도해 두면, 충전율이 실제로 계산하는 병과 어긋나지 않는다.
 WATER_MASS_MAX = WATER_DENSITY * BOTTLE_VOLUME
 
@@ -175,26 +357,51 @@ class Parameters:
         BOTTLE_MASS, "float", "kg", "빈 병 질량 / empty bottle mass",
         "mass of the empty bottle",
         span=(0.005, 0.2, 0.001))
+    neck_radius: float = _field(
+        NECK_RADIUS, "float", "m", "목 반지름 / neck radius",
+        "inner radius at the cap; set it equal to bottle_radius for a plain "
+        "cylinder",
+        span=(0.004, 0.09, 0.0005))
+    shoulder_start: float = _field(
+        SHOULDER_START, "float", "1", "어깨 시작 / shoulder starts at",
+        "height where the body starts narrowing, as a fraction of the height",
+        span=(0.3, 1.0, 0.01))
+    shoulder_end: float = _field(
+        SHOULDER_END, "float", "1", "어깨 끝 / shoulder ends at",
+        "height where the neck radius is reached, as a fraction of the height",
+        span=(0.3, 1.0, 0.01))
+    base_radius: float = _field(
+        0.0, "float", "m", "바닥 접지 반지름 / base contact radius",
+        "radius of the ring the bottle actually stands on; 0 takes 85% of the "
+        "body radius, which is what the petaloid base of a PET bottle touches",
+        span=(0.0, 0.09, 0.001))
 
     # --- water ---
     water_mass: float = _field(
-        0.35, "float", "kg", "물의 질량 / water mass",
-        "mass of water in the bottle; a filling fraction of 0.2-0.4 is where "
+        0.17, "float", "kg", "물의 질량 / water mass",
+        "mass of liquid in the bottle; a filling fraction of 0.2-0.4 is where "
         "the flip works",
-        span=(0.01, 1.4, 0.01))
+        span=(0.005, 0.5, 0.005))
     water_density: float = _field(
         WATER_DENSITY, "float", "kg/m^3", "물의 밀도 / water density",
         "density of the liquid",
-        span=(500.0, 1500.0, 10.0))
+        span=(500.0, 2000.0, 10.0))
+    kinematic_viscosity: float = _field(
+        WATER_KINEMATIC_VISCOSITY, "float", "m^2/s",
+        "동점성계수 / kinematic viscosity",
+        "viscosity of the liquid; used only when drag_rate is 0, where the "
+        "wall drag is derived from it instead of being set by hand",
+        span=(1e-7, 1e-3, 1e-7))
     drag_rate: float = _field(
         10.0, "float", "1/s", "단위질량당 항력 / drag per unit mass",
-        "linear wall drag per unit mass; the damping time is tau = 2/drag_rate",
-        span=(0.5, 60.0, 0.5))
+        "linear wall drag per unit mass; the damping time is tau = 2/drag_rate."
+        " Set it to 0 to derive it from kinematic_viscosity instead",
+        span=(0.0, 60.0, 0.5))
     restitution: float = _field(
-        -0.3, "float", "1", "반발계수 / restitution",
-        "restitution coefficient at the caps; negative, it reverses the "
-        "velocity and takes energy out",
-        span=(-1.0, 0.0, 0.05))
+        0.3, "float", "1", "반발계수 / restitution",
+        "restitution coefficient at the walls, between 0 and 1; either sign is "
+        "accepted, only the magnitude is physical",
+        span=(0.0, 1.0, 0.05))
 
     # --- throw ---
     omega_0: float = _field(
@@ -202,9 +409,10 @@ class Parameters:
         "angular velocity at release",
         span=(1.0, 60.0, 0.5))
     theta_0: float = _field(
-        math.pi / 2, "float", "rad", "초기 각도 / initial angle",
-        "orientation of the bottle at release",
-        span=(0.0, 6.2832, 0.05))
+        0.0, "float", "rad", "초기 기울기 / initial tilt",
+        "tilt of the bottle axis away from straight up at release; 0 is "
+        "upright (base down), pi is upside down",
+        span=(-3.1416, 3.1416, 0.05))
     gravity: float = _field(
         G, "float", "m/s^2", "중력가속도 / gravity",
         "gravitational acceleration; used for the flight time, and for the "
@@ -216,12 +424,26 @@ class Parameters:
         "for the phase where the bottle is still held")
     t_max: float = _field(
         0.6, "float", "s", "비행 시간 / flight duration",
-        "duration of the simulated flight",
+        "duration of the simulated flight; used when flight = 'fixed'",
         span=(0.05, 2.0, 0.01))
     drop_height: float = _field(
         None, "optional_float", "m", "낙하 높이 / drop height",
-        "if given, the flight duration is the free fall time from this "
-        "height instead of t_max")
+        "free-fall height; used when flight = 'drop'")
+    flight: str = _field(
+        "launch", "choice", "", "비행 시간의 근거 / what sets the flight time",
+        "'launch' throws the bottle upward at launch_speed and lands it "
+        "release_drop below the release point (a real toss); 'drop' lets it "
+        "fall from drop_height; 'fixed' just uses t_max",
+        choices=("launch", "drop", "fixed"))
+    launch_speed: float = _field(
+        2.0, "float", "m/s", "던져 올리는 속도 / launch speed",
+        "upward speed of the bottle at release; with the drop below, this is "
+        "what sets how long the bottle is in the air",
+        span=(0.0, 6.0, 0.05))
+    release_drop: float = _field(
+        0.1, "float", "m", "놓은 높이 - 착지 높이 / release above landing",
+        "how far the bottle's centre of mass ends up below the release point",
+        span=(-0.5, 1.5, 0.01))
 
     # --- discretisation ---
     model: str = _field(
@@ -253,6 +475,11 @@ class Parameters:
     euler: bool = _field(
         True, "bool", "", "오일러 항 / Euler force",
         "parcel model only; the azimuthal force from a changing omega")
+    relative_momentum: bool = _field(
+        True, "bool", "", "물의 상대 각운동량 / water's own angular momentum",
+        "keep the angular momentum the liquid carries by moving inside the "
+        "bottle, so that omega follows from L_total = J omega + L_relative "
+        "rather than from L = J omega. It is worth about 10% of the total")
     overlap_iterations: int = _field(
         3, "int", "", "겹침 투영 반복 / overlap sweeps per step",
         "parcel model only; projection sweeps used to remove overlaps",
@@ -309,12 +536,85 @@ class Parameters:
     # --- derived quantities ---
 
     @property
+    def shape(self):
+        """반지름 곡선을 부르는 데 필요한 인자들.
+
+        The arguments the radius-profile helpers take.
+        """
+        return dict(radius=self.bottle_radius, neck=self.neck_radius,
+                    height=self.bottle_height,
+                    shoulder_start=self.shoulder_start,
+                    shoulder_end=self.shoulder_end)
+
+    def radius_at(self, z):
+        """높이 ``z`` 에서의 병 안쪽 반지름 [m].
+
+        Inner radius of this bottle at height ``z``, unit: m.
+        """
+        return radius_profile(z, **self.shape)
+
+    def volume_below(self, z):
+        """높이 ``z`` 아래의 병 내부 부피 [m**3].
+
+        Interior volume below ``z``, unit: m**3.
+        """
+        return cumulative_volume(z, **self.shape)
+
+    def height_of_volume(self, volume):
+        """부피 ``volume`` 을 담는 높이 [m] — :meth:`volume_below` 의 역함수.
+
+        Height holding this volume below it, unit: m.
+        """
+        return height_at_volume(volume, **self.shape)
+
+    @property
     def bottle_volume(self):
-        """병의 내부 부피 [m^3].
+        """병의 내부 부피 [m^3] — 몸통과 어깨와 목을 합친 것.
 
         Interior volume of the bottle, unit: m**3.
         """
-        return math.pi * self.bottle_radius ** 2 * self.bottle_height
+        return float(cumulative_volume(self.bottle_height, **self.shape))
+
+    @property
+    def contact_radius(self):
+        """병이 실제로 딛고 서는 바닥 링의 반지름 [m].
+
+        Radius of the ring the bottle actually stands on, unit: m.
+
+        PET 병의 바닥은 평평하지 않고 꽃잎 모양이라, 닿는 자리는 몸통 반지름
+        보다 작다.  넘어지는지 서는지를 가르는 것이 바로 이 반지름이다.
+        """
+        return self.base_radius if self.base_radius else 0.85 * self.bottle_radius
+
+    @property
+    def shell_moments(self):
+        """빈 병의 질량 분포 — 단위 질량당 ``(z_cm, ring, second)``.
+
+        Mass distribution of the empty bottle, per unit mass.
+        """
+        return _shell_moments_cached(self.bottle_radius, self.neck_radius,
+                                     self.bottle_height, self.shoulder_start,
+                                     self.shoulder_end)
+
+    @property
+    def bottle_center_of_mass(self):
+        """빈 병만의 질량중심 높이 [m].
+
+        Height of the centre of mass of the empty bottle, unit: m.
+
+        원통이라면 정확히 절반이지만, 목이 좁은 실제 병은 질량이 아래에
+        몰려 있어 그보다 낮다.
+        """
+        return self.shell_moments[0]
+
+    def bottle_inertia(self, z_axis, y_axis=0.0):
+        """``(y_axis, z_axis)`` 를 지나는 횡축에 대한 빈 병의 관성모멘트 [kg m^2].
+
+        Transverse moment of inertia of the empty bottle about that axis.
+        """
+        z_cm, ring, second = self.shell_moments
+        return self.bottle_mass * (ring + second - 2 * z_axis * z_cm
+                                   + z_axis ** 2 + y_axis ** 2)
 
     @property
     def water_mass_max(self):
@@ -325,26 +625,42 @@ class Parameters:
         return self.water_density * self.bottle_volume
 
     @property
+    def water_volume(self):
+        """액체의 부피 [m^3].
+
+        Volume of the liquid, unit: m**3.
+        """
+        return self.water_mass / self.water_density
+
+    @property
     def filling_fraction(self):
         """병 부피에서 액체가 차지하는 비율.
 
         Fraction of the bottle volume occupied by the liquid.
         """
-        return self.water_mass / self.water_mass_max
+        return self.water_volume / self.bottle_volume
 
     @property
     def water_height(self):
-        """가만히 두었을 때 물기둥의 높이 [m].
+        """가만히 세워 두었을 때 물의 수면 높이 [m].
 
-        Height of the liquid column at rest, unit: m.
+        Height of the free surface of the liquid at rest, unit: m.
+
+        원통이라면 충전율에 병 높이를 곱한 것이지만, 목이 있는 병에서는
+        부피의 대부분이 몸통에 있으므로 수면이 그보다 낮다.
         """
-        return self.filling_fraction * self.bottle_height
+        return float(self.height_of_volume(self.water_volume))
 
     @property
     def epsilon(self):
         """빈 병이 전체 질량에서 차지하는 비율.
 
         Mass fraction of the empty bottle.
+
+        자유비행에서 물의 운동방정식에는 질량이 들어가지 않는다. 물의 종류와
+        질량이 결과에 들어오는 통로는 이 값 하나뿐이다 (그리고 점성을 통한
+        ``tau``).  "물질의 종류나 질량과 무관하다" 는 주장을 검사할 때 보아야
+        할 수는 충전율과 이 값이다.
         """
         return self.bottle_mass / (self.bottle_mass + self.water_mass)
 
@@ -353,15 +669,61 @@ class Parameters:
         """벽 항력의 감쇠 시간 [s].
 
         Damping time of the wall drag, unit: s.
+
+        ``drag_rate`` 를 0 으로 두면 동점성계수에서 유도한다: 병 반지름 규모의
+        전단층이 운동량을 벽으로 나르므로 ``tau ~ R**2 / nu`` 이고, 물처럼
+        점성이 낮은 액체에서는 이 값이 비행 시간보다 훨씬 길다 — 즉 물의
+        점성은 뒤집기에 거의 관여하지 않는다.
         """
-        return 2 / self.drag_rate
+        if self.drag_rate > 0:
+            return 2 / self.drag_rate
+        return self.bottle_radius ** 2 / max(self.kinematic_viscosity, 1e-12)
+
+    @property
+    def drag_per_mass(self):
+        """운동방정식에 들어가는 항력 계수 ``2 / tau`` [1/s].
+
+        The drag coefficient ``2 / tau`` entering the equations of motion.
+        """
+        return 2 / self.tau
+
+    @property
+    def bounce(self):
+        """벽 반사에 쓰는 반발계수 — 언제나 0 과 1 사이.
+
+        Restitution used at the walls, always between 0 and 1.
+
+        예전 코드는 이 값이 음수여야 반사가 되고 양수면 조용히 물이 벽을
+        통과했다.  부호는 여기서 붙이므로, 어느 쪽으로 넣어도 물리가 같다.
+        """
+        return min(abs(self.restitution), 1.0)
 
     @property
     def duration(self):
         """시뮬레이션하는 비행 시간 [s].
 
         Simulated flight duration, unit: s.
+
+        ``flight = "launch"`` 이면 실제로 던져 올린 병이 공중에 있는 시간이다:
+        위로 ``launch_speed`` 로 던져 ``release_drop`` 만큼 아래에 떨어지므로
+        ``t = (v + sqrt(v**2 + 2 g h)) / g``.  비행 시간은 뒤집기의 성패를
+        좌우하는데, 예전처럼 0.6 s 로 고정해 두면 던지는 세기를 바꿔도 시간이
+        따라오지 않아 실제 던지기와 어긋난다.
         """
+        if self.flight == "launch":
+            v = self.launch_speed
+            g = self.gravity
+            if g <= 0:
+                raise ValueError("a launched flight needs a non-zero gravity")
+            inside = v ** 2 + 2 * g * self.release_drop
+            if inside < 0:
+                raise ValueError(
+                    "the bottle never comes back down to the landing height")
+            return (v + math.sqrt(inside)) / g
+        if self.flight == "drop":
+            if self.drop_height is None:
+                raise ValueError("flight = 'drop' needs a drop_height")
+            return math.sqrt(2 * self.drop_height / self.gravity)
         if self.drop_height is not None:
             return math.sqrt(2 * self.drop_height / self.gravity)
         return self.t_max
@@ -401,10 +763,25 @@ class Parameters:
                     "bottle_radius": self.bottle_radius,
                     "bottle_mass": self.bottle_mass,
                     "water_density": self.water_density,
-                    "drag_rate": self.drag_rate}
+                    "neck_radius": self.neck_radius,
+                    "kinematic_viscosity": self.kinematic_viscosity}
         for name, value in positive.items():
             if not value > 0:
                 raise ValueError("%s must be positive (got %r)" % (name, value))
+        if self.drag_rate < 0:
+            raise ValueError("drag_rate must not be negative")
+        if self.neck_radius > self.bottle_radius:
+            raise ValueError("the neck cannot be wider than the body")
+        if not 0 < self.shoulder_start <= self.shoulder_end <= 1:
+            raise ValueError(
+                "the shoulder must satisfy 0 < shoulder_start <= shoulder_end "
+                "<= 1 (got %r, %r)" % (self.shoulder_start, self.shoulder_end))
+        if self.base_radius < 0 or self.base_radius > self.bottle_radius:
+            raise ValueError("base_radius must be between 0 and bottle_radius")
+        if self.flight not in ("launch", "drop", "fixed"):
+            raise ValueError("flight must be 'launch', 'drop' or 'fixed'")
+        if self.launch_speed < 0:
+            raise ValueError("launch_speed must not be negative")
         if not 0 < self.water_mass < self.water_mass_max:
             raise ValueError(
                 "water_mass must be between 0 and %.4f kg for this bottle "
@@ -468,11 +845,13 @@ class Parameters:
                 lines.append("  %-46s %12s %s"
                              % (field.metadata["label"], shown, unit))
         lines.append("--- 유도량 / derived " + "-" * 32)
+        lines.append("  병 부피 / bottle volume                      %12.1f mL"
+                     % (1e6 * self.bottle_volume))
         lines.append("  물 최대 질량 / full bottle holds              %12.4f kg"
                      % self.water_mass_max)
         lines.append("  충전율 / filling fraction                    %12.4f"
                      % self.filling_fraction)
-        lines.append("  물기둥 높이 / column height                   %12.4f m"
+        lines.append("  수면 높이 / free surface at rest              %12.4f m"
                      % self.water_height)
         lines.append("  빈 병 질량비 / bottle mass fraction           %12.4f"
                      % self.epsilon)
@@ -480,20 +859,26 @@ class Parameters:
                      % self.tau)
         lines.append("  비행 시간 / flight duration                   %12.4f s"
                      % self.duration)
+        lines.append("  접지 반지름 / base contact radius             %12.4f m"
+                     % self.contact_radius)
         return "\n".join(lines)
 
 
 FIELDS = {field.name: field for field in dataclasses.fields(Parameters)}
 
 FIELD_GROUPS = [
-    ("병 / bottle", ("bottle_height", "bottle_radius", "bottle_mass")),
-    ("물 / water", ("water_mass", "water_density", "drag_rate",
-                    "restitution")),
+    ("병 / bottle", ("bottle_height", "bottle_radius", "bottle_mass",
+                     "neck_radius", "shoulder_start", "shoulder_end",
+                     "base_radius")),
+    ("물 / water", ("water_mass", "water_density", "kinematic_viscosity",
+                    "drag_rate", "restitution")),
     ("던지기 / throw", ("omega_0", "theta_0", "gravity", "include_gravity",
+                        "flight", "launch_speed", "release_drop",
                         "t_max", "drop_height")),
     ("이산화 / discretisation",
      ("model", "n_slices", "n_pieces", "n_steps", "water_at_top",
-      "incompressible", "coriolis", "euler", "overlap_iterations")),
+      "incompressible", "coriolis", "euler", "relative_momentum",
+      "overlap_iterations")),
     ("구슬 / beads", ("n_beads", "bead_radius", "bead_mass",
                       "contact_stiffness", "surface_tension",
                       "cohesion_coefficient", "cohesion_range",
@@ -895,17 +1280,22 @@ def neighbour_pairs(positions, cutoff, chunk=None):
 #   experiments and numerical simulations", Eur. J. Phys. 45, 065003 (2024),
 #   doi:10.1088/1361-6404/ad6e43 (arXiv:2407.20627).
 
-def find_center_of_mass(positions, eps, length_bottle=BOTTLE_HEIGHT):
+def find_center_of_mass(positions, eps, bottle_center=None,
+                        length_bottle=BOTTLE_HEIGHT):
     """병과 물을 합친 계의 질량중심이 병 축에서 어디인가.
 
     Axial position of the centre of mass of the bottle + water system.
 
     ``eps`` is the mass fraction of the empty bottle,
-    ``eps = m_bottle / (m_bottle + m_water)``.  The bottle's own centre of
-    mass sits at mid-height; the water contributes the mean slice position
-    because all slices carry the same mass.
+    ``eps = m_bottle / (m_bottle + m_water)``.  ``bottle_center`` is where the
+    empty bottle's own centre of mass sits; a real bottle with a narrow neck
+    carries its mass low, so it is *not* mid-height (that is the default only
+    for a plain cylinder).  All slices carry the same mass, so the water
+    contributes the mean slice position.
     """
-    return eps * length_bottle / 2 + (1 - eps) * np.mean(positions)
+    if bottle_center is None:
+        bottle_center = length_bottle / 2
+    return eps * bottle_center + (1 - eps) * np.mean(positions)
 
 
 def rotational_inertia_water(positions, center_of_mass, water_mass,
@@ -914,26 +1304,39 @@ def rotational_inertia_water(positions, center_of_mass, water_mass,
 
     Moment of inertia of the water about the transverse axis at ``center_of_mass``.
 
-    Each slice is a solid disc of radius ``radius``: its own moment of
-    inertia about a diameter is ``m * radius**2 / 4``, to which the parallel
-    axis theorem adds ``m * (r - r_cm)**2``.  Dropping the ``radius**2 / 4``
-    term underestimates J by several percent for a slender bottle.
+    Each slice is a solid disc: its own moment of inertia about a diameter is
+    ``m * R**2 / 4``, to which the parallel axis theorem adds
+    ``m * (r - r_cm)**2``.  ``radius`` may be a single number (a cylinder) or
+    one radius per slice — in a real bottle a slice sitting in the neck is
+    much narrower than one in the body, and using the body radius everywhere
+    overestimates J for the water that has climbed into the neck.
     """
     positions = np.asarray(positions, dtype=float)
+    radius = np.asarray(radius, dtype=float)
     slice_mass = water_mass / positions.size
-    return water_mass * radius ** 2 / 4 + slice_mass * np.sum(
-        (positions - center_of_mass) ** 2)
+    return slice_mass * float(np.sum(radius ** 2 / 4
+                                     + (positions - center_of_mass) ** 2))
 
 
 def rotational_inertia_bottle(center_of_mass, mass_bottle=BOTTLE_MASS,
-                              radius=BOTTLE_RADIUS, length=BOTTLE_HEIGHT):
+                              radius=BOTTLE_RADIUS, length=BOTTLE_HEIGHT,
+                              neck=None, shoulder_start=SHOULDER_START,
+                              shoulder_end=SHOULDER_END, y_axis=0.0):
     """같은 횡축에 대한 빈 병의 관성모멘트.
 
     Moment of inertia of the empty bottle about the transverse axis at ``center_of_mass``.
+
+    ``neck`` 를 주면 몸통-어깨-목 모양의 껍질로, 주지 않으면 예전처럼 균질한
+    원통 껍질로 계산한다.
     """
-    j_bottle_axis = mass_bottle * (radius ** 2 / 2 + length ** 2 / 12)
-    # 평행축 정리
-    return j_bottle_axis + mass_bottle * (length / 2 - center_of_mass) ** 2
+    if neck is None:
+        j_own = mass_bottle * (radius ** 2 / 2 + length ** 2 / 12)
+        return j_own + mass_bottle * ((length / 2 - center_of_mass) ** 2
+                                      + y_axis ** 2)
+    z_cm, ring, second = _shell_moments_cached(radius, neck, length,
+                                               shoulder_start, shoulder_end)
+    return mass_bottle * (ring + second - 2 * center_of_mass * z_cm
+                          + center_of_mass ** 2 + y_axis ** 2)
 
 
 def update_slice_positions(positions, velocities, center_of_mass,
@@ -998,22 +1401,28 @@ def check_boundary_conditions(positions, velocities, restitution, l_min, l_max):
 
     The slice is mirrored about the wall it crossed, and the rebound
     distance is scaled by ``|restitution|`` so that position and velocity
-    lose energy consistently.  ``restitution`` is negative, so multiplying
-    the velocity by it reverses the motion.  (Freezing the slice at its
-    previous position instead makes slices stick to the walls.)
+    lose energy consistently.  (Freezing the slice at its previous position
+    instead makes slices stick to the walls.)
+
+    Only the magnitude of ``restitution`` is physical: the reflection reverses
+    the velocity here, whatever sign it was given.  The old code multiplied
+    the velocity by ``restitution`` as it stood, so a positive value — the
+    way anybody would write a restitution coefficient — silently let the water
+    keep driving into the wall instead of bouncing off it.
 
     ``positions`` and ``velocities`` are modified in place and returned.
     """
     positions = np.asarray(positions, dtype=float)
     velocities = np.asarray(velocities, dtype=float)
+    bounce = min(abs(restitution), 1.0)
 
     below = positions < l_min
-    positions[below] = l_min + abs(restitution) * (l_min - positions[below])
-    velocities[below] *= restitution
+    positions[below] = l_min + bounce * (l_min - positions[below])
+    velocities[below] *= -bounce
 
     above = positions > l_max
-    positions[above] = l_max - abs(restitution) * (positions[above] - l_max)
-    velocities[above] *= restitution
+    positions[above] = l_max - bounce * (positions[above] - l_max)
+    velocities[above] *= -bounce
 
     # 한 스텝에 병 길이보다 멀리 움직인 원판은, 한 번 반사해도 반대쪽 벽을
     # 넘어갈 수 있다.
@@ -1021,60 +1430,61 @@ def check_boundary_conditions(positions, velocities, restitution, l_min, l_max):
     return positions, velocities
 
 
-def enforce_incompressibility(positions, velocities, slice_height,
-                              l_min, l_max):
+def enforce_incompressibility(positions, velocities, slice_volume,
+                              s_min, s_max, to_volume, to_height):
     """물 원판들이 서로 겹치거나 지나치지 못하게 한다.
 
     Keep the water slices from overlapping or crossing each other.
 
-    Water is incompressible: two slices cannot occupy the same volume, so
-    consecutive slices must stay at least ``slice_height`` apart.  Without
-    this constraint the slices are independent and the whole column collapses
-    onto a single point at each cap, which overestimates the moment of
-    inertia of the accumulated water.
+    물은 압축되지 않으므로 원판 두 장이 같은 부피를 차지할 수 없다.  원통이면
+    "원판 두께만큼 떨어져 있어야 한다" 로 끝나지만, 실제 병처럼 단면이
+    변하면 원판의 두께가 있는 자리마다 다르다 — 목에서는 얇고 몸통에서는
+    두껍다.
 
-    Overlaps are removed by projecting the sorted slice positions onto the
-    feasible set (a forward sweep away from the bottom, then a backward sweep
-    away from the cap).  Slices that end up in contact are treated as a
-    perfectly inelastic contact and share the mean velocity of their contact
-    group, which conserves the momentum of that group.
+    그래서 제약을 높이 ``z`` 가 아니라 **부피 좌표** ``s = S(z)`` (바닥부터
+    그 높이까지의 병 부피) 에서 건다.  같은 질량의 원판은 어디에 있든 같은
+    부피 ``slice_volume`` 을 차지하므로, 부피 좌표에서는 간격이 일정한 문제가
+    되어 원통일 때와 똑같은 투영으로 풀린다.  이것이 좁은 목을 지나는 물을
+    제대로 다루는 방법이다: 목에서는 같은 부피가 훨씬 긴 길이를 차지한다.
 
-    ``positions`` and ``velocities`` are modified in place and returned.
+    Slices that end up in contact are treated as a perfectly inelastic contact
+    and share the mean velocity of their contact group, which conserves the
+    momentum of that group.
     """
     positions = np.asarray(positions, dtype=float)
     velocities = np.asarray(velocities, dtype=float)
     n = positions.size
     if n < 2:
         return positions, velocities
-    if n * slice_height > (l_max - l_min) + slice_height:
-        raise ValueError("the water column does not fit inside the bottle")
+    if n * slice_volume > (s_max - s_min) + slice_volume * (1 + 1e-9):
+        raise ValueError("the water does not fit inside the bottle")
 
-    order = np.argsort(positions, kind="stable")
-    p = positions[order]
+    s = np.asarray(to_volume(positions), dtype=float)
+    order = np.argsort(s, kind="stable")
+    p = s[order]
     v = velocities[order]
 
-    # 아래에서 위로 밀어 올리는 투영. p[i] = max(p[i], p[i-1] + h) 를 하나씩
+    # 아래에서 위로 밀어 올리는 투영. p[i] = max(p[i], p[i-1] + dV) 를 하나씩
     # 돌리는 것과 같은데, 계단을 빼고 누적 최대를 취하면 원판 수와 무관하게
-    # 한 번의 numpy 연산으로 끝난다 (원판이 수백 개일 때 파이썬 루프보다
-    # 훨씬 빠르다).
-    ladder = np.arange(n) * slice_height
+    # 한 번의 numpy 연산으로 끝난다.
+    ladder = np.arange(n) * slice_volume
+    p = np.maximum(p, s_min)
     p = np.maximum.accumulate(p - ladder) + ladder
     # 위에서 아래로 되밀기: 뚜껑을 뚫고 나간 기둥을 다시 내려보낸다.
-    p[n - 1] = min(p[n - 1], l_max)
+    p[n - 1] = min(p[n - 1], s_max)
     p = (np.minimum.accumulate(p[::-1] + ladder) - ladder)[::-1]
-    np.clip(p, l_min, l_max, out=p)
+    np.clip(p, s_min, s_max, out=p)
 
     # 완전 비탄성 접촉: 맞닿은 원판들은 함께 움직인다. 접촉 그룹마다 평균
-    # 속도를 주면 그 그룹의 운동량이 보존된다. 그룹 경계에서 누적합을 잘라
-    # 쓰므로 이것도 원판 수에 비례하는 한 번의 계산이다.
-    in_contact = np.diff(p) <= slice_height * (1 + 1e-9)
+    # 속도를 주면 그 그룹의 운동량이 보존된다.
+    in_contact = np.diff(p) <= slice_volume * (1 + 1e-9)
     group = np.concatenate(([0], np.cumsum(~in_contact)))
     starts = np.flatnonzero(np.concatenate(([True], np.diff(group) != 0)))
     sums = np.add.reduceat(v, starts)
     sizes = np.diff(np.concatenate((starts, [n])))
     v = np.repeat(sums / sizes, sizes)
 
-    positions[order] = p
+    positions[order] = np.asarray(to_height(p), dtype=float)
     velocities[order] = v
     return positions, velocities
 
@@ -1409,7 +1819,7 @@ def advance_parcels(y, z, velocities, propagator):
 
 
 def apply_walls(x, y, z, velocities, restitution, parcel_radius_,
-                radius=BOTTLE_RADIUS, height=BOTTLE_HEIGHT):
+                radius=BOTTLE_RADIUS, height=BOTTLE_HEIGHT, shape=None):
     """조각을 측벽과 두 뚜껑에서 튕겨 낸다 (제자리 수정).
 
     Rebound the parcels off the side wall and the two caps, in place.
@@ -1418,23 +1828,49 @@ def apply_walls(x, y, z, velocities, restitution, parcel_radius_,
     ``sqrt((R - a)**2 - x**2)``.  The rebound mirrors the parcel and scales the
     excursion by ``|restitution|``, as in the disc model.
     """
-    limit = np.sqrt(np.maximum((radius - parcel_radius_) ** 2 - x ** 2, 0.0))
-    damping = abs(restitution)
+    if shape is None:
+        wall = np.full_like(z, float(radius))
+    else:
+        # 실제 병에서는 벽까지의 거리가 높이마다 다르다: 어깨 위로 올라간
+        # 조각은 훨씬 좁은 곳에 있다.
+        wall = radius_profile(z, **shape)
+    limit = np.sqrt(np.maximum((wall - parcel_radius_) ** 2 - x ** 2, 0.0))
+    bounce = min(abs(restitution), 1.0)
 
     above = y > limit
-    y[above] = limit[above] - damping * (y[above] - limit[above])
+    y[above] = limit[above] - bounce * (y[above] - limit[above])
     below = y < -limit
-    y[below] = -limit[below] + damping * (-limit[below] - y[below])
-    velocities[above | below, 0] *= restitution
+    y[below] = -limit[below] + bounce * (-limit[below] - y[below])
+    velocities[above | below, 0] *= -bounce
     np.clip(y, -limit, limit, out=y)
 
     z_min, z_max = parcel_radius_, height - parcel_radius_
     low = z < z_min
-    z[low] = z_min + damping * (z_min - z[low])
+    z[low] = z_min + bounce * (z_min - z[low])
     high = z > z_max
-    z[high] = z_max - damping * (z[high] - z_max)
-    velocities[low | high, 1] *= restitution
+    z[high] = z_max - bounce * (z[high] - z_max)
+    velocities[low | high, 1] *= -bounce
     np.clip(z, z_min, z_max, out=z)
+
+    # 어깨보다 굵은 자리에 있던 조각이 좁은 곳으로 올라오면 아예 들어갈 수
+    # 없다. 그런 조각은 들어갈 수 있는 높이까지 도로 내려보낸다 — 그러지
+    # 않으면 병 축에 눌러 붙어 물이 목을 그냥 통과해 버린다.
+    if shape is not None:
+        need = np.sqrt(x ** 2 + y ** 2) + parcel_radius_
+        stuck = need > wall
+        if np.any(stuck):
+            idx = np.flatnonzero(stuck)
+            for _ in range(20):
+                if idx.size == 0:
+                    break
+                z[idx] -= 0.25 * parcel_radius_
+                np.clip(z, z_min, z_max, out=z)
+                wall_now = radius_profile(z[idx], **shape)
+                keep = np.sqrt(x[idx] ** 2 + y[idx] ** 2) + parcel_radius_ \
+                    > wall_now
+                velocities[idx[keep], 1] = np.minimum(
+                    velocities[idx[keep], 1], 0.0)
+                idx = idx[keep]
     return y, z, velocities
 
 
@@ -2083,35 +2519,50 @@ def simulate(params=None, progress=None, **overrides):
 
     Integrate the flip with the water as discs sliding along the axis.
 
+    원판은 같은 **질량** 을 갖는다. 단면이 변하는 병에서는 그것이 같은 두께를
+    뜻하지 않으므로, 원판의 자리는 부피 좌표에서 잡고 (:func:`height_at_volume`)
+    비압축성 제약도 거기서 건다.  목에 들어간 원판은 길게 늘어나고, 관성모멘트를
+    셀 때도 그 자리의 좁은 반지름을 쓴다.
+
     ``progress(step, n_steps)`` 를 주면 스텝마다 불러 진행 상황을 알린다.
-    원판 위치의 이력은 :func:`recorded_steps` 가 정한 스텝에만 남기므로,
-    스텝과 원판을 아무리 늘려도 메모리가 정해진 예산 안에 머문다.
     """
     p = resolve_parameters(params, **overrides)
 
     t, dt = np.linspace(0, p.duration, p.n_steps, retstep=True)
-    slice_height = p.water_height / p.n_slices
-    l_min = slice_height / 2
-    l_max = p.bottle_height - slice_height / 2
+
+    # 부피 좌표에서 같은 질량(=같은 부피)의 원판으로 나눈다.
+    bottle_volume = p.bottle_volume
+    slice_volume = p.water_volume / p.n_slices
+    s_min = slice_volume / 2
+    s_max = bottle_volume - slice_volume / 2
+    l_min = float(p.height_of_volume(s_min))
+    l_max = float(p.height_of_volume(s_max))
 
     # 병은 자유낙하 중에 관찰한다. 놓는 순간 물기둥은 이미 뚜껑 쪽에
     # 붙어 있다.
     if p.water_at_top:
-        slices_positions = l_max - np.arange(p.n_slices) * slice_height
+        s0 = s_max - np.arange(p.n_slices) * slice_volume
     else:
-        slices_positions = l_min + np.arange(p.n_slices) * slice_height
+        s0 = s_min + np.arange(p.n_slices) * slice_volume
+    slices_positions = np.asarray(p.height_of_volume(s0), dtype=float)
     slices_velocities = np.zeros(p.n_slices)
 
-    center_of_mass = find_center_of_mass(slices_positions, p.epsilon,
-                                         p.bottle_height)
+    bottle_center = p.bottle_center_of_mass
+
+    def state_of(positions):
+        """원판 분포 하나에서 질량중심과 관성모멘트를 얻는다."""
+        cm = find_center_of_mass(positions, p.epsilon, bottle_center)
+        j = (rotational_inertia_water(positions, cm, p.water_mass,
+                                      p.radius_at(positions))
+             + p.bottle_inertia(cm))
+        return cm, j
+
+    center_of_mass, rotational_inertia = state_of(slices_positions)
     _warn_if_degenerate(slices_positions.min(), slices_positions.max(),
                         center_of_mass, p)
-    rotational_inertia = (
-        rotational_inertia_water(slices_positions, center_of_mass,
-                                 p.water_mass, p.bottle_radius)
-        + rotational_inertia_bottle(center_of_mass, p.bottle_mass,
-                                    p.bottle_radius, p.bottle_height))
     # 자유비행 중에는 외부 돌림힘이 없으므로 이 값은 상수다.
+    # 원판은 병 축 위에서 축 방향으로만 움직이므로 (r - r_cm) x v = 0 이다:
+    # 원판 모델에서는 물의 상대 각운동량이 정확히 0 이고, L = J omega 가 맞다.
     angular_momentum = rotational_inertia * p.omega_0
 
     omega_values = np.zeros(p.n_steps)
@@ -2141,20 +2592,15 @@ def simulate(params=None, progress=None, **overrides):
             slices_positions, slices_velocities, center_of_mass, omega, theta,
             p.tau, dt, p.axial_gravity)
         new_positions, new_velocities = check_boundary_conditions(
-            new_positions, new_velocities, p.restitution, l_min, l_max)
+            new_positions, new_velocities, p.bounce, l_min, l_max)
         if p.incompressible:
             new_positions, new_velocities = enforce_incompressibility(
-                new_positions, new_velocities, slice_height, l_min, l_max)
+                new_positions, new_velocities, slice_volume, s_min, s_max,
+                p.volume_below, p.height_of_volume)
 
         # 질량중심과 관성모멘트는 이전 분포가 아니라 방금 구한 새 원판
         # 분포에서 나온다.
-        new_center_of_mass = find_center_of_mass(
-            new_positions, p.epsilon, p.bottle_height)
-        new_rotational_inertia = (
-            rotational_inertia_water(new_positions, new_center_of_mass,
-                                     p.water_mass, p.bottle_radius)
-            + rotational_inertia_bottle(new_center_of_mass, p.bottle_mass,
-                                        p.bottle_radius, p.bottle_height))
+        new_center_of_mass, new_rotational_inertia = state_of(new_positions)
         new_omega = angular_momentum / new_rotational_inertia
         # 사다리꼴 적분: theta + omega * dt 와 달리 dt 에 대해 2차 정확도.
         new_theta = theta + (omega + new_omega) * dt / 2
@@ -2189,8 +2635,11 @@ def simulate(params=None, progress=None, **overrides):
         "center_of_mass": center_of_mass_values,
         "rotational_inertia": rotational_inertia_values,
         "angular_momentum": angular_momentum,
+        "relative_angular_momentum": np.zeros(p.n_steps),
         "water_height": p.water_height,
-        "slice_height": slice_height,
+        "slice_volume": slice_volume,
+        "slice_height": slice_volume / (np.pi * p.bottle_radius ** 2),
+        "water_mass_used": p.water_mass,
         "tau": p.tau,
         "filling_fraction": p.filling_fraction,
     }
