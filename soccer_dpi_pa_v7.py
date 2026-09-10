@@ -253,6 +253,23 @@ def looks_centered(x, y):
             and abs(float(np.median(y))) < PITCH_W * 0.25)
 
 
+def find_height_col(df):
+    """
+    공 높이 열을 찾는다. 'ball_z' 로 인식된 열이 우선이고, 없으면 이름이 그냥
+    'z' 인 열을 쓴다.
+
+    'z' 를 ALIAS 에 넣지 않는 이유: 선수 표의 z 는 높이가 아닌 다른 것일 수
+    있다. 하지만 공만 있는 시트나 공 행에서의 z 는 높이로 봐도 된다.
+    이 함수는 그 두 곳에서만 부른다.
+    """
+    if "ball_z" in df.columns:
+        return "ball_z"
+    for c in df.columns:
+        if _norm(c) == "z":
+            return c
+    return None
+
+
 BALL_WORDS = ("ball", "공", "볼")
 
 
@@ -443,9 +460,17 @@ def read_data():
         b = map_columns(load_table(path, SHEET_BALL))
         if "frame" not in b.columns and "time_s" in b.columns:
             b["frame"] = np.round(b["time_s"] * (FPS or 25.0)).astype(int)
-        bcols = ["frame", "ball_x", "ball_y"] + (["ball_z"] if "ball_z" in b.columns else [])
-        ball = (b[bcols] if {"ball_x", "ball_y"} <= set(b.columns)
-                else b[["frame", "X", "Y"]].rename(columns={"X": "ball_x", "Y": "ball_y"}))
+        # 높이 열은 어느 이름으로 오든 챙긴다. 예전에는 X/Y 로 된 공 시트에서
+        # 높이를 통째로 버려서, 같은 데이터인데 입력 형식만 다르면 공중볼
+        # 처리가 조용히 무력화됐다.
+        zc = find_height_col(b)
+        if {"ball_x", "ball_y"} <= set(b.columns):
+            ball = b[["frame", "ball_x", "ball_y"] + ([zc] if zc else [])]
+        else:
+            ball = b[["frame", "X", "Y"] + ([zc] if zc else [])].rename(
+                columns={"X": "ball_x", "Y": "ball_y"})
+        if zc:
+            ball = ball.rename(columns={zc: "ball_z"})
         how = "별도 시트"
     elif {"ball_x", "ball_y"} <= set(tracks.columns):
         bcols = ["ball_x", "ball_y"] + (["ball_z"] if "ball_z" in tracks.columns else [])
@@ -458,8 +483,13 @@ def read_data():
             if col in tracks.columns:
                 m = _is_ball(tracks[col])
                 if m.any():
-                    ball = (tracks[m].groupby("frame")[["X", "Y"]].first()
+                    zc = find_height_col(tracks)        # 공 행의 z 는 높이다
+                    take = ["X", "Y"] + ([zc] if zc else [])
+                    ball = (tracks[m].groupby("frame")[take].first()
                             .rename(columns={"X": "ball_x", "Y": "ball_y"}).reset_index())
+                    if zc:
+                        ball = ball.rename(columns={zc: "ball_z"})
+                        tracks = tracks.drop(columns=[zc])
                     tracks = tracks[~m].copy()
                     how = f"'{col}' 열의 ball 표시"
                     break
@@ -471,7 +501,13 @@ def read_data():
             "  (b) cls / team / track_id 열에 'ball' 인 행\n"
             "  (c) SHEET_BALL 에 공 시트 이름 지정\n"
             f"실제 열: {list(tracks.columns)}")
-    print(f"  공 좌표: {how} 에서 {len(ball)} 프레임분")
+    if "ball_z" in ball.columns:
+        hi = float((ball["ball_z"].fillna(0) > BALL_AIRBORNE_Z).mean())
+        print(f"  공 좌표: {how} 에서 {len(ball)} 프레임분 , 높이 열 있음 "
+              f"(공중볼 {hi*100:.0f}% — 이 구간은 소유자 판정에서 빠진다)")
+    else:
+        print(f"  공 좌표: {how} 에서 {len(ball)} 프레임분 , 높이 열 없음 "
+              f"(크로스·헤더 구간을 지상 최근접으로 판정하게 된다)")
 
     # ── 필수 열 ──────────────────────────────────────────────
     miss = {"frame", "track_id", "X", "Y"} - set(tracks.columns)
@@ -1267,7 +1303,17 @@ def mean_dist_own_goal(tracks, teams):
 def detect_goalkeepers(dist_goal, tracks, teams):
     """팀마다 자기 골대에 가장 붙어 있는 한 명을 골키퍼로 본다."""
     if GK_IDS is not None:
-        return set(GK_IDS)
+        # 직접 지정한 id 는 실제 데이터에 있는 것만 쓴다. 오타가 있거나
+        # ID 재연결(repair_ids)이 이름을 바꿔 놓았으면 없는 id 가 되는데,
+        # 걸러내지 않으면 SC 계산을 다 끝낸 맨 마지막에 KeyError 로 죽는다.
+        have = set(dist_goal.index)
+        keep = {i for i in GK_IDS if i in have}
+        for i in set(GK_IDS) - keep:
+            print(f"  ! GK_IDS 의 '{i}' 는 데이터에 없는 track_id 다 (무시).")
+        if not keep:
+            print("  ! GK_IDS 중 데이터와 맞는 id 가 없다. 골키퍼를 자동 추정한다.")
+        else:
+            return keep
     team_of = tracks.groupby("track_id")["team"].first()
     gks = set()
     for t in teams:
@@ -1325,6 +1371,14 @@ def total_contribution(agg, tracks, teams):
     if gks:
         print(f"           골키퍼로 보고 제외: {sorted(gks)} "
               f"(자기 골대까지 평균 {dist_goal[list(gks)].mean():.1f} m)")
+    if len(gks) < 2:
+        # 한 팀 골키퍼만 빠지면 남은 골키퍼가 SC 를 쓸어담은 채로 순위에 남아
+        # 팀 사이가 불공평해진다. 짧은 구간에서는 골키퍼가 골대에서 멀어 보여
+        # (팀이 올라가 있으면) 판정을 못 하는 경우가 있다.
+        print(f"           ! 골키퍼를 {len(gks)}명만 찾았다 (팀당 한 명이어야 한다). "
+              f"남은 골키퍼가 SC 상위권을 차지한 채 순위에 들어간다.")
+        print(f"             GK_MAX_DIST(현재 {GK_MAX_DIST:.0f} m)를 늘리거나 GK_IDS 로 "
+              f"직접 지정할 것.")
     if thin.any():
         print(f"           표본 부족으로 제외: {list(a.index[thin])}")
     miss = use & a["TC"].isna()
@@ -1433,15 +1487,24 @@ def self_test():
     pick = lambda fr_, x_: rid[(rid.frame == fr_) & (rid.X == x_)].track_id.iloc[0]
     c9 = (pick(1, 10.2) == pick(0, 10.0)) and (pick(1, 95.0) != pick(0, 60.0))
 
+    # 공 높이 열은 이름이 뭐로 오든 찾아야 한다. 못 찾으면 입력 형식만 달라도
+    # 공중볼 처리가 조용히 꺼진다(실측: 같은 데이터에서 39프레임 -> 0프레임).
+    _cols = lambda *cs: pd.DataFrame(columns=list(cs))
+    c10 = (find_height_col(_cols("frame", "ball_x", "ball_y", "ball_z")) == "ball_z"
+           and find_height_col(_cols("frame", "X", "Y", "Z")) == "Z"
+           and find_height_col(_cols("frame", "X", "Y")) is None
+           and find_height_col(_cols("frame", "Z", "ball_z")) == "ball_z")
+
     for nm, c in [("등속 5.00 m/s 정확", c1), ("추적 끊김 구간 NaN", c2),
                   ("team 열 통과", c3), (f"효율성 공리 (오차 {abs(sc.sum()-tot):.0e})", c4),
                   (f"협력 수비 보존 ({s2[0]:.0f} vs {s2[1]:.0f})", c5),
                   ("위험도 가중치 방향", c6),
                   (f"먼 거리 복귀주력은 압박 아님 (근접 {near:.3f} vs 원거리 {far:.3f})", c7),
                   ("라인 밖 사람이 있어도 원점 판정 유지", c8),
-                  ("ID 재연결이 순간이동을 잇지 않음", c9)]:
+                  ("ID 재연결이 순간이동을 잇지 않음", c9),
+                  ("공 높이 열 인식 (ball_z / Z / 없음)", c10)]:
         print(f"  {'PASS' if c else '**FAIL**':9s} {nm}")
-    if not all([c1, c2, c3, c4, c5, c6, c7, c8, c9]):
+    if not all([c1, c2, c3, c4, c5, c6, c7, c8, c9, c10]):
         raise SystemExit("검증 실패. 아래 결과를 믿으면 안 된다.")
 
 
