@@ -1620,45 +1620,74 @@ def lattice_spacing(n_pieces, radius=BOTTLE_RADIUS):
                                    + root_two_pi / 2)
 
 
-def _fill_column(n_pieces, column_height, water_at_top, radius, height):
-    """조각을 층으로 쌓아 물기둥을 채워 본다.
+def _fill_column(n_pieces, water_volume, water_at_top, radius, height,
+                 shape=None):
+    """조각을 층으로 쌓아 물을 채워 본다.
+
+    층을 하나씩 쌓되, 채운 구간이 담는 **병의 부피** 가 물의 부피에 이를 때까지
+    쌓는다.  단면이 일정한 원통이면 예전처럼 "물기둥 높이 / 층 간격" 과 같지만,
+    목이 있는 병에서는 그렇지 않다: 목은 부피가 거의 없으므로 물이 뚜껑 쪽에
+    있어도 대부분은 어깨 아래 몸통에 있어야 한다.  각 층에 놓을 수 있는 조각은
+    그 높이의 반지름 ``R(z)`` 이 정한다.
 
     돌려주는 것은 ``(x, y, z, 조각 반지름, 격자 간격, 층 수)`` 이고, 조각이
-    두 개도 놓이지 않으면 ``None`` 이다 — 부르는 쪽이 단면을 더 잘게 쪼개어
-    다시 시도한다.
+    두 개도 놓이지 않으면 ``None`` 이다.
     """
     spacing = lattice_spacing(n_pieces, radius)
     a = spacing / 2
     if a >= radius:
         return None
 
+    def wall_at(z):
+        if shape is None:
+            return float(radius)
+        return float(radius_profile(z, **shape))
+
+    def volume_to(z):
+        if shape is None:
+            return float(np.pi * radius ** 2 * z)
+        return float(cumulative_volume(z, **shape))
+
     layer_gap = spacing * np.sqrt(2 / 3)
-    n_layers = max(1, int(round(column_height / layer_gap)))
     # ABAB 쌓기의 층별 어긋남: 둘째 층이 첫째 층의 오목한 곳에 앉는다.
     offsets = [(0.0, 0.0), (spacing / 2, spacing * np.sqrt(3) / 6)]
+    start = volume_to(height) if water_at_top else 0.0
 
     xs, ys, zs = [], [], []
-    for layer in range(n_layers):
-        lx, ly = _hexagonal_layer(spacing, radius - a, offsets[layer % 2])
+    layer = 0
+    filled = 0.0
+    max_layers = int(np.ceil(height / layer_gap)) + 2
+    while filled < water_volume and layer < max_layers:
         if water_at_top:
             z = height - a - layer * layer_gap
         else:
             z = a + layer * layer_gap
         if z < a or z > height - a:
-            return None
-        xs.append(lx)
-        ys.append(ly)
-        zs.append(np.full(lx.size, z))
+            break
+        available = wall_at(z) - a
+        if available > 0:
+            lx, ly = _hexagonal_layer(spacing, available, offsets[layer % 2])
+            if lx.size:
+                xs.append(lx)
+                ys.append(ly)
+                zs.append(np.full(lx.size, z))
+        # 이 층까지 덮은 구간이 담는 병 부피
+        edge = z - layer_gap / 2 if water_at_top else z + layer_gap / 2
+        edge = min(max(edge, 0.0), height)
+        filled = abs(volume_to(edge) - start)
+        layer += 1
 
+    if not xs:
+        return None
     x = np.concatenate(xs)
     if x.size < 2:
         return None
-    return (x, np.concatenate(ys), np.concatenate(zs), a, spacing, n_layers)
+    return (x, np.concatenate(ys), np.concatenate(zs), a, spacing, len(xs))
 
 
 def seed_parcels(water_mass, n_pieces, water_at_top=True,
                  radius=BOTTLE_RADIUS, height=BOTTLE_HEIGHT,
-                 density=WATER_DENSITY):
+                 density=WATER_DENSITY, shape=None):
     """물기둥을 조각으로 채운다 — 단면마다 ``n_pieces`` 개.
 
     조각은 ``n_pieces`` 에서 따라오는 간격 ``d`` 의 육각 최밀충전에 놓인다.
@@ -1677,20 +1706,24 @@ def seed_parcels(water_mass, n_pieces, water_at_top=True,
 
     Fill the water column with parcels, ``n_pieces`` per cross section.
     """
-    column_height = water_mass / density / (np.pi * radius ** 2)
-    if column_height > height:
+    water_volume = water_mass / density
+    bottle_volume = float(cumulative_volume(height, **shape)) if shape \
+        else float(np.pi * radius ** 2 * height)
+    if water_volume > bottle_volume:
         raise ValueError(
-            "물 %.4f kg 은 이 병(반지름 %.3f m, 높이 %.3f m)에 들어가지 "
-            "않습니다 / the water does not fit inside the bottle"
-            % (water_mass, radius, height))
+            "물 %.4f kg (%.1f mL) 은 이 병(%.1f mL)에 들어가지 않습니다 / the "
+            "water does not fit inside the bottle"
+            % (water_mass, 1e6 * water_volume, 1e6 * bottle_volume))
+    column_height = float(height_at_volume(water_volume, **shape)) if shape \
+        else water_volume / (np.pi * radius ** 2)
 
     asked_pieces = n_pieces
-    packed = _fill_column(n_pieces, column_height, water_at_top, radius,
-                          height)
+    packed = _fill_column(n_pieces, water_volume, water_at_top, radius,
+                          height, shape)
     while packed is None and n_pieces < 4096:
         n_pieces = max(4, 4 * n_pieces)
-        packed = _fill_column(n_pieces, column_height, water_at_top, radius,
-                              height)
+        packed = _fill_column(n_pieces, water_volume, water_at_top, radius,
+                              height, shape)
     if packed is None:
         raise ValueError(
             "이 병에서는 조각을 두 개도 놓을 수 없습니다 / too few parcels: "
@@ -1714,15 +1747,30 @@ def seed_parcels(water_mass, n_pieces, water_at_top=True,
             "pieces_per_layer": n / n_layers}
 
 
-def parcel_center_of_mass(y, z, eps, length_bottle=BOTTLE_HEIGHT):
+def parcel_center_of_mass(y, z, eps, length_bottle=BOTTLE_HEIGHT,
+                          bottle_center=None):
     """병과 물을 합친 계의 질량중심 ``(y_cm, z_cm)``.
 
     Centre of mass ``(y_cm, z_cm)`` of the bottle + water system.
 
-    The empty bottle sits on the axis at mid height, so it only pulls the
-    transverse coordinate back towards ``y = 0``.
+    The empty bottle sits on the axis, so it only pulls the transverse
+    coordinate back towards ``y = 0``.  Its own centre of mass is
+    ``bottle_center`` — mid-height only for a plain cylinder.
     """
-    return (1 - eps) * np.mean(y), eps * length_bottle / 2 + (1 - eps) * np.mean(z)
+    if bottle_center is None:
+        bottle_center = length_bottle / 2
+    return ((1 - eps) * float(np.mean(y)),
+            eps * bottle_center + (1 - eps) * float(np.mean(z)))
+
+
+def parcel_relative_angular_momentum(y, z, velocities, y_cm, z_cm, mass):
+    """물이 병 안에서 움직여서 갖는 각운동량 (조각 모델).
+
+    Angular momentum the parcels carry by moving within the bottle.
+    """
+    n = np.asarray(y).size
+    return mass / n * float(np.sum((y - y_cm) * velocities[:, 1]
+                                   - (z - z_cm) * velocities[:, 0]))
 
 
 def parcel_rotational_inertia_water(y, z, y_cm, z_cm, water_mass):
@@ -2061,7 +2109,7 @@ def bead_size(water_mass, n_beads, bead_radius=0.0, bead_mass=0.0,
 
 
 def largest_bead_that_fits(n_beads, radius=BOTTLE_RADIUS,
-                           height=BOTTLE_HEIGHT, margin=0.98):
+                           height=BOTTLE_HEIGHT, margin=0.98, shape=None):
     """``n_beads`` 개가 이 병에 들어갈 수 있는 구슬 반지름의 상한.
 
     두 가지 제약 가운데 작은 쪽이다.
@@ -2074,25 +2122,34 @@ def largest_bead_that_fits(n_beads, radius=BOTTLE_RADIUS,
     """
     if n_beads < 1:
         raise ValueError("n_beads must be at least 1")
-    by_volume = (3 * CLOSE_PACKING * radius ** 2 * height
-                 / (4 * n_beads)) ** (1 / 3)
+    volume = float(cumulative_volume(height, **shape)) if shape \
+        else float(np.pi * radius ** 2 * height)
+    by_volume = (3 * CLOSE_PACKING * volume / (4 * np.pi * n_beads)) ** (1 / 3)
     return margin * min(by_volume, 0.95 * radius)
 
 
-def _stack(n_beads, bead, radius, height, water_at_top):
+def _stack(n_beads, bead, radius, height, water_at_top, shape=None):
     """반지름 ``bead`` 인 구슬 ``n_beads`` 개를 한쪽 뚜껑에 쌓아 본다.
 
     격자 간격은 접촉 지름이므로 구슬들은 겹치지 않고 맞닿은 상태로 출발한다.
+    각 층에 놓을 수 있는 자리는 그 높이의 병 반지름 ``R(z)`` 이 정하므로,
+    목 근처의 층에는 몇 개밖에 들어가지 않고 나머지는 아래 몸통으로 내려간다 —
+    실제 병에서 물이 뚜껑 쪽에 있을 때의 모습이다.
+
     병 안에 다 들어가지 않으면 ``None`` 을 돌려준다 — 부르는 쪽이 구슬을
     줄여서 다시 시도한다.
     """
     pitch = 2 * bead
     layer_gap = pitch * np.sqrt(2 / 3)
-    max_radius = radius - bead
-    if max_radius <= 0 or bead >= height / 2:
+    if bead >= height / 2:
         return None
 
-    reach = int(np.ceil(2 * max_radius / pitch)) + 2
+    def wall_at(z):
+        if shape is None:
+            return float(radius)
+        return float(radius_profile(z, **shape))
+
+    reach = int(np.ceil(2 * radius / pitch)) + 2
     grid_i, grid_j = np.meshgrid(np.arange(-reach, reach + 1),
                                  np.arange(-reach, reach + 1), indexing="ij")
     offsets = [(0.0, 0.0), (bead, pitch * np.sqrt(3) / 6)]
@@ -2100,36 +2157,43 @@ def _stack(n_beads, bead, radius, height, water_at_top):
     placed = []
     count = 0
     layer = 0
-    while count < n_beads:
+    max_layers = int(np.ceil(height / layer_gap)) + 2
+    while count < n_beads and layer < max_layers:
         shift = offsets[layer % 2]
         x = (grid_i + 0.5 * (grid_j % 2)) * pitch + shift[0]
         y = grid_j * (np.sqrt(3) / 2) * pitch + shift[1]
         x, y = x.ravel(), y.ravel()
-        inside = x ** 2 + y ** 2 <= max_radius ** 2
-        x, y = x[inside], y[inside]
-        if x.size == 0:
-            return None
-        # 각 층을 축에서 바깥으로 채운다: 마지막 남은 층이 가운데 모인다
-        order = np.argsort(x ** 2 + y ** 2)
-        x, y = x[order], y[order]
         if water_at_top:
             z = height - bead - layer * layer_gap
         else:
             z = bead + layer * layer_gap
         if z < bead or z > height - bead:
             return None
-        take = min(x.size, n_beads - count)
-        placed.append(np.column_stack([x[:take], y[:take],
+        max_radius = wall_at(z) - bead
+        layer += 1
+        if max_radius <= 0:
+            # 목이 구슬보다 좁다: 이 층은 비우고 아래로 내려간다
+            continue
+        inside = x ** 2 + y ** 2 <= max_radius ** 2
+        lx, ly = x[inside], y[inside]
+        if lx.size == 0:
+            continue
+        # 각 층을 축에서 바깥으로 채운다: 마지막 남은 층이 가운데 모인다
+        order = np.argsort(lx ** 2 + ly ** 2)
+        lx, ly = lx[order], ly[order]
+        take = min(lx.size, n_beads - count)
+        placed.append(np.column_stack([lx[:take], ly[:take],
                                        np.full(take, z)]))
         count += take
-        layer += 1
 
-    return np.concatenate(placed), layer
+    if count < n_beads or not placed:
+        return None
+    return np.concatenate(placed), len(placed)
 
 
 def seed_beads(water_mass, n_beads, bead_radius=0.0, bead_mass=0.0,
                water_at_top=True, radius=BOTTLE_RADIUS, height=BOTTLE_HEIGHT,
-               density=WATER_DENSITY):
+               density=WATER_DENSITY, shape=None):
     """``n_beads`` 개의 구슬을 한쪽 뚜껑에 최밀충전으로 쌓는다.
 
     구슬이 병에 들어가지 않는 조합 — 반지름을 손으로 크게 준 경우, 구슬이
@@ -2140,17 +2204,17 @@ def seed_beads(water_mass, n_beads, bead_radius=0.0, bead_mass=0.0,
     bead, mass, total = bead_size(water_mass, n_beads, bead_radius, bead_mass,
                                   density)
 
-    limit = largest_bead_that_fits(n_beads, radius, height)
+    limit = largest_bead_that_fits(n_beads, radius, height, shape=shape)
     asked = bead
     if bead > limit:
         bead = limit
-    stacked = _stack(n_beads, bead, radius, height, water_at_top)
+    stacked = _stack(n_beads, bead, radius, height, water_at_top, shape)
     # 층으로 쌓는 이산성 때문에 상한을 지켰어도 마지막 한 층이 삐져나갈 수
     # 있다. 그때는 들어갈 때까지 조금씩 줄인다.
     attempts = 0
     while stacked is None and attempts < 200:
         bead *= 0.95
-        stacked = _stack(n_beads, bead, radius, height, water_at_top)
+        stacked = _stack(n_beads, bead, radius, height, water_at_top, shape)
         attempts += 1
     if stacked is None:
         raise ValueError(
@@ -2255,26 +2319,57 @@ def pair_accelerations(positions, velocities, pairs, bead_radius, bead_mass,
 
 def wall_accelerations(positions, velocities, bead_radius, bead_mass,
                        stiffness, damping, radius=BOTTLE_RADIUS,
-                       height=BOTTLE_HEIGHT):
+                       height=BOTTLE_HEIGHT, shape=None):
     """측벽과 두 뚜껑과의 접촉에서 오는 가속도.
 
     Contact accelerations from the side wall and the two caps.
+
+    ``shape`` 를 주면 벽은 원통이 아니라 실제 병의 회전면 ``r = R(z)`` 이다.
+    어깨에서는 벽이 기울어져 있으므로 법선이 축 방향 성분을 갖는다 — 물을
+    안쪽으로만이 아니라 **아래로도** 밀어내는 이 성분이, 원심력에 밀려 올라온
+    물을 목이 붙잡는 힘이다.  원통 벽에는 없는 항이고, 뒤집기에서 물이
+    얼마나 퍼지는지를 실제로 좌우한다.
     """
     accelerations = np.zeros_like(positions)
 
     # 측벽: 겹침은 (x, y) 평면에서 반지름 방향이다
     lateral = positions[:, :2]
     span = np.sqrt(np.einsum("ij,ij->i", lateral, lateral))
-    overlap = span - (radius - bead_radius)
+    if shape is None:
+        wall = np.full(span.shape, float(radius))
+        slope = np.zeros_like(span)
+    else:
+        z = positions[:, 2]
+        wall = radius_profile(z, **shape)
+        # dR/dz: 몸통과 목에서는 0, 어깨에서만 음수
+        z_1 = shape["shoulder_start"] * shape["height"]
+        z_2 = shape["shoulder_end"] * shape["height"]
+        if z_2 > z_1:
+            tilt = (shape["neck"] - shape["radius"]) / (z_2 - z_1)
+        else:
+            tilt = 0.0
+        slope = np.where((z > z_1) & (z < z_2), tilt, 0.0)
+
+    # 기울어진 벽에서는 벽까지의 최단거리가 반지름 차이보다 짧다:
+    # 원뿔면까지의 수직 거리는 (R(z) - span) * cos(alpha), tan(alpha) = |R'|.
+    scale = 1.0 / np.sqrt(1 + slope ** 2)
+    overlap = bead_radius - (wall - span) * scale
     pressing = overlap > 0
     if pressing.any():
         safe = np.where(span > 1e-15, span, 1.0)
-        normal = lateral / safe[:, None]
-        approach = np.einsum("ij,ij->i", velocities[:, :2], normal)
-        magnitude = -(stiffness * overlap[pressing]
-                      + damping * approach[pressing]) / bead_mass
-        accelerations[pressing, 0] += magnitude * normal[pressing, 0]
-        accelerations[pressing, 1] += magnitude * normal[pressing, 1]
+        radial = lateral / safe[:, None]
+        # 안쪽을 향하는 법선 (-r_hat, +slope) / sqrt(1 + slope**2)
+        nx = -radial[:, 0] * scale
+        ny = -radial[:, 1] * scale
+        nz = slope * scale
+        # 벽을 파고드는 속도 (양수면 더 깊이 들어가는 중)
+        approach = -(velocities[:, 0] * nx + velocities[:, 1] * ny
+                     + velocities[:, 2] * nz)
+        magnitude = (stiffness * overlap[pressing]
+                     + damping * approach[pressing]) / bead_mass
+        accelerations[pressing, 0] += magnitude * nx[pressing]
+        accelerations[pressing, 1] += magnitude * ny[pressing]
+        accelerations[pressing, 2] += magnitude * nz[pressing]
 
     # 위아래 뚜껑
     bottom = bead_radius - positions[:, 2]
@@ -2331,14 +2426,16 @@ def bead_rotational_inertia(positions, y_cm, z_cm, bead_mass, bead_radius):
         + 2 / 5 * n * bead_mass * bead_radius ** 2
 
 
-def bead_center_of_mass(positions, eps, length_bottle=BOTTLE_HEIGHT):
+def bead_center_of_mass(positions, eps, length_bottle=BOTTLE_HEIGHT,
+                        bottle_center=None):
     """병과 구슬을 합친 질량중심 ``(y_cm, z_cm)``.
 
     Centre of mass ``(y_cm, z_cm)`` of the bottle plus beads.
     """
+    if bottle_center is None:
+        bottle_center = length_bottle / 2
     return ((1 - eps) * float(np.mean(positions[:, 1])),
-            eps * length_bottle / 2
-            + (1 - eps) * float(np.mean(positions[:, 2])))
+            eps * bottle_center + (1 - eps) * float(np.mean(positions[:, 2])))
 
 
 def relative_angular_momentum(positions, velocities, y_cm, z_cm, bead_mass):
@@ -2346,8 +2443,11 @@ def relative_angular_momentum(positions, velocities, y_cm, z_cm, bead_mass):
 
     Angular momentum the beads carry by moving within the bottle.
 
-    The total is ``L = J omega + this``; the disc and parcel models drop it,
-    so it is reported rather than assumed away.
+    The total is ``L = J omega + this``, so the angular velocity of the bottle
+    follows from ``omega = (L - L_rel) / J``.  It is worth about 10% of the
+    total here — dropping it, as the code used to, is not a small error.  In
+    the disc model it vanishes identically: those slices sit on the axis and
+    move along it, so ``(r - r_cm) x v = 0``.
     """
     offset_y = positions[:, 1] - y_cm
     offset_z = positions[:, 2] - z_cm
@@ -2665,18 +2765,22 @@ def simulate_parcels(params=None, progress=None, **overrides):
     seed = seed_parcels(p.water_mass, p.n_pieces,
                         water_at_top=p.water_at_top,
                         radius=p.bottle_radius, height=p.bottle_height,
-                        density=p.water_density)
+                        density=p.water_density, shape=p.shape)
     x, y, z = seed["x"], seed["y"].copy(), seed["z"].copy()
     velocities = seed["velocities"].copy()
     a = seed["parcel_radius"]
     n_parcels = seed["n_parcels"]
 
-    y_cm, z_cm = parcel_center_of_mass(y, z, p.epsilon, p.bottle_height)
+    bottle_center = p.bottle_center_of_mass
+    y_cm, z_cm = parcel_center_of_mass(y, z, p.epsilon, p.bottle_height,
+                                       bottle_center)
     _warn_if_degenerate(z.min(), z.max(), z_cm, p)
     rotational_inertia = (
         parcel_rotational_inertia_water(y, z, y_cm, z_cm, p.water_mass)
-        + parcel_rotational_inertia_bottle(y_cm, z_cm, p.bottle_mass,
-                                           p.bottle_radius, p.bottle_height))
+        + p.bottle_inertia(z_cm, y_cm))
+    # 놓는 순간 물은 병에 대해 정지해 있으므로 상대 각운동량은 0 이고,
+    # 전체 각운동량은 J * omega_0 이다. 그 뒤로는 물이 병 안에서 움직이므로
+    # L = J omega + L_rel 이 되고, omega 는 그 나머지에서 나온다.
     angular_momentum = rotational_inertia * p.omega_0
 
     omega_values = np.zeros(p.n_steps)
@@ -2684,6 +2788,7 @@ def simulate_parcels(params=None, progress=None, **overrides):
     center_of_mass_values = np.zeros(p.n_steps)
     center_of_mass_y_values = np.zeros(p.n_steps)
     rotational_inertia_values = np.zeros(p.n_steps)
+    relative_momentum_values = np.zeros(p.n_steps)
     # 조각이 수천 개가 되면 전체 이력이 수백 MB 이므로 예산 안에서만 남긴다
     steps, stride = recorded_steps(p.n_steps, n_parcels)
     y_values = np.zeros((steps.size, n_parcels))
@@ -2708,20 +2813,24 @@ def simulate_parcels(params=None, progress=None, **overrides):
                                  p.coriolis, p.euler)
         advance_parcels(y, z, velocities, propagator)
         apply_walls(x, y, z, velocities, p.restitution, a,
-                    p.bottle_radius, p.bottle_height)
+                    p.bottle_radius, p.bottle_height, p.shape)
         if p.incompressible:
             resolve_overlaps(x, y, z, velocities, a,
                              iterations=p.overlap_iterations)
             apply_walls(x, y, z, velocities, p.restitution, a,
-                        p.bottle_radius, p.bottle_height)
+                        p.bottle_radius, p.bottle_height, p.shape)
 
-        y_cm, z_cm = parcel_center_of_mass(y, z, p.epsilon, p.bottle_height)
+        y_cm, z_cm = parcel_center_of_mass(y, z, p.epsilon, p.bottle_height,
+                                           bottle_center)
         new_rotational_inertia = (
             parcel_rotational_inertia_water(y, z, y_cm, z_cm, p.water_mass)
-            + parcel_rotational_inertia_bottle(y_cm, z_cm, p.bottle_mass,
-                                               p.bottle_radius,
-                                               p.bottle_height))
-        new_omega = angular_momentum / new_rotational_inertia
+            + p.bottle_inertia(z_cm, y_cm))
+        relative = parcel_relative_angular_momentum(
+            y, z, velocities, y_cm, z_cm, p.water_mass)
+        new_omega = ((angular_momentum - relative) / new_rotational_inertia
+                     if p.relative_momentum
+                     else angular_momentum / new_rotational_inertia)
+        relative_momentum_values[k] = relative
         # 다음 스텝의 오일러 힘에 넣을 각가속도를, 방금의 변화에서 그대로
         # 추정한다.
         omega_dot = (new_omega - omega) / dt
@@ -2757,6 +2866,7 @@ def simulate_parcels(params=None, progress=None, **overrides):
         "center_of_mass_y": center_of_mass_y_values,
         "rotational_inertia": rotational_inertia_values,
         "angular_momentum": angular_momentum,
+        "relative_angular_momentum": relative_momentum_values,
         "water_height": seed["column_height"],
         "parcel_radius": a,
         "n_parcels": n_parcels,
@@ -2792,7 +2902,7 @@ def simulate_beads(params=None, progress=None, **overrides):
     seed = seed_beads(p.water_mass, p.n_beads, p.bead_radius,
                       p.bead_mass, water_at_top=p.water_at_top,
                       radius=p.bottle_radius, height=p.bottle_height,
-                      density=p.water_density)
+                      density=p.water_density, shape=p.shape)
     positions = seed["positions"].copy()
     velocities = seed["velocities"].copy()
     bead_radius = seed["bead_radius"]
@@ -2825,18 +2935,21 @@ def simulate_beads(params=None, progress=None, **overrides):
             bead_mass, stiffness, damping, cohesion, p.cohesion_range)
         total += wall_accelerations(
             current_positions, current_velocities, bead_radius, bead_mass,
-            stiffness, wall_damping, p.bottle_radius, p.bottle_height)
+            stiffness, wall_damping, p.bottle_radius, p.bottle_height,
+            p.shape)
         total += frame_accelerations(
             current_positions, current_velocities, omega, omega_dot, y_cm,
             z_cm, p.tau, p.axial_gravity, angle, p.coriolis, p.euler)
         return total
 
-    y_cm, z_cm = bead_center_of_mass(positions, epsilon, p.bottle_height)
+    bottle_center = p.bottle_center_of_mass
+    y_cm, z_cm = bead_center_of_mass(positions, epsilon, p.bottle_height,
+                                     bottle_center)
     _warn_if_degenerate(positions[:, 2].min(), positions[:, 2].max(), z_cm, p)
     rotational_inertia = (
         bead_rotational_inertia(positions, y_cm, z_cm, bead_mass, bead_radius)
-        + parcel_rotational_inertia_bottle(y_cm, z_cm, p.bottle_mass,
-                                           p.bottle_radius, p.bottle_height))
+        + p.bottle_inertia(z_cm, y_cm))
+    # 놓는 순간 물은 병에 대해 정지해 있으므로 L_rel = 0 이다.
     angular_momentum = rotational_inertia * p.omega_0
 
     omega_values = np.zeros(p.n_steps)
@@ -2880,14 +2993,20 @@ def simulate_beads(params=None, progress=None, **overrides):
                                z_cm, theta)
             velocities += 0.5 * sub_dt * acc
 
-        y_cm, z_cm = bead_center_of_mass(positions, epsilon, p.bottle_height)
+        y_cm, z_cm = bead_center_of_mass(positions, epsilon, p.bottle_height,
+                                         bottle_center)
         new_rotational_inertia = (
             bead_rotational_inertia(positions, y_cm, z_cm, bead_mass,
                                     bead_radius)
-            + parcel_rotational_inertia_bottle(y_cm, z_cm, p.bottle_mass,
-                                               p.bottle_radius,
-                                               p.bottle_height))
-        new_omega = angular_momentum / new_rotational_inertia
+            + p.bottle_inertia(z_cm, y_cm))
+        # 물이 병 안에서 도는 몫을 빼고 나서야 병의 각속도가 나온다.
+        # L_total = J omega + L_rel 이고, 여기서 L_rel 은 전체의 10% 에
+        # 이르므로 예전처럼 버리면 회전이 그만큼 어긋난다.
+        relative = relative_angular_momentum(positions, velocities, y_cm,
+                                             z_cm, bead_mass)
+        new_omega = ((angular_momentum - relative) / new_rotational_inertia
+                     if p.relative_momentum
+                     else angular_momentum / new_rotational_inertia)
         omega_dot = (new_omega - omega) / dt
         new_theta = theta + (omega + new_omega) * dt / 2
 
@@ -2896,8 +3015,7 @@ def simulate_beads(params=None, progress=None, **overrides):
         center_of_mass_values[k] = z_cm
         center_of_mass_y_values[k] = y_cm
         rotational_inertia_values[k] = new_rotational_inertia
-        relative_momentum_values[k] = relative_angular_momentum(
-            positions, velocities, y_cm, z_cm, bead_mass)
+        relative_momentum_values[k] = relative
         if pairs[0].size:
             delta = positions[pairs[0]] - positions[pairs[1]]
             distance = np.sqrt(np.einsum("ij,ij->i", delta, delta))
@@ -2991,12 +3109,14 @@ def format_report(results, show_inputs=True):
         lines.append("max overlap      : %.3f%% of a diameter (soft contacts)"
                      % (100 * results["max_overlap"].max()
                         / (2 * results["bead_radius"])))
-        lines.append("relative L       : %.2e kg m^2/s at most, %.2f%% of the "
-                     "total (dropped by every model)"
+        lines.append("relative L       : %.2e kg m^2/s at most, %.2f%% of "
+                     "the total (%s)"
                      % (np.max(np.abs(results["relative_angular_momentum"])),
                         100 * np.max(np.abs(
                             results["relative_angular_momentum"]))
-                        / results["angular_momentum"]))
+                        / max(abs(results["angular_momentum"]), 1e-30),
+                        "kept in omega" if p.relative_momentum
+                        else "dropped: relative_momentum is off"))
     elif results["model"] == "parcels":
         lines.append("discretisation   : %d parcels, %.1f per cross section in "
                      "%d layers, exclusion radius %.1f mm"
@@ -3010,9 +3130,14 @@ def format_report(results, show_inputs=True):
                  % (j[0], j[-1], j[-1] / j[0]))
     lines.append("angular velocity : %.2f -> %.2f rad/s (x%.2f)"
                  % (omega[0], omega[-1], omega[-1] / omega[0]))
+    # 보존을 확인할 양은 J*omega 가 아니라 J*omega + L_rel 이다.
+    relative = results.get("relative_angular_momentum")
+    if relative is None:
+        relative = np.zeros_like(omega)
+    total = j * omega + (relative if p.relative_momentum else 0.0)
     lines.append("angular momentum : %.6e kg m^2/s, drift %.2e"
                  % (results["angular_momentum"],
-                    np.max(np.abs(j * omega - results["angular_momentum"]))))
+                    np.max(np.abs(total - results["angular_momentum"]))))
     lines.append("rotation in %.2f s: %.2f rad = %.3f turns"
                  % (results["t"][-1], theta[-1] - theta[0], turns))
     lines.append("landing angle    : %.3f rad (%.0f deg from the release "
