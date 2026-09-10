@@ -978,9 +978,13 @@ def calculate_sc(tracks, F, teams):
     meta = F.set_index("frame")
     rows, t0, n = [], time.perf_counter(), 0
     frames = sorted(set(tracks.frame.unique()) & set(meta.index[meta.usable]))
+    # 프레임별로 미리 쪼개 둔다. 예전에는 루프 안에서 tracks[tracks.frame == fr] 로
+    # 매 프레임 전체 표를 훑었는데, 이건 프레임 수 × 행 수라서 90분 경기(13.5만
+    # 프레임 × 300만 행)에서는 격자 계산보다 스캔이 더 오래 걸린다.
+    by_frame = {f: g for f, g in tracks.groupby("frame", sort=False)}
     for fr in frames:
         m = meta.loc[fr]
-        g = tracks[tracks.frame == fr]
+        g = by_frame[fr]
         att_t = m.poss_team
         def_t = teams[0] if att_t == teams[1] else teams[1]
         att = g[g.team == att_t][["X", "Y"]].to_numpy(float)
@@ -1638,15 +1642,29 @@ def main():
     print(f"  (표시한 열은 {len(show)}개다. 성분별 원값과 z 점수 등 전체 "
           f"{len(agg.columns)}개 열은 {SAVE_XLSX} 의 '선수별' 시트에 있다)")
 
+    # 엑셀 한 시트에는 1,048,576 행까지만 들어간다. 프레임별 표는 프레임 하나에
+    # 열 명 남짓씩 쌓이므로 45분만 넣어도 이 한계를 넘는다(실측: 3분 72,258행
+    # -> 45분 약 108만행). 그대로 to_excel 하면 SC 를 수십 분 계산한 맨 마지막에
+    # 저장이 터져서 결과가 전부 날아간다. 큰 표는 CSV 로 따로 뺀다.
+    XLSX_MAX_ROWS = 1_000_000
+    saved, spilled = [], []
     with pd.ExcelWriter(SAVE_XLSX, engine="openpyxl") as w:
         agg.reset_index().to_excel(w, sheet_name="선수별", index=False)
-        M.to_excel(w, sheet_name="프레임별", index=False)
-        F.to_excel(w, sheet_name="프레임메타", index=False)
-        if len(PAdf):
-            PAdf.to_excel(w, sheet_name="PA프레임별", index=False)
-        if len(passes):
-            passes.to_excel(w, sheet_name="검출된패스", index=False)
-    print(f"\n[저장] {SAVE_XLSX}  (시트 3개: 선수별 / 프레임별 / 프레임메타)")
+        saved.append("선수별")
+        for nm, df_ in (("프레임별", M), ("프레임메타", F),
+                        ("PA프레임별", PAdf), ("검출된패스", passes)):
+            if not len(df_):
+                continue
+            if len(df_) > XLSX_MAX_ROWS:
+                path = f"{os.path.splitext(SAVE_XLSX)[0]}_{nm}.csv"
+                df_.to_csv(path, index=False)
+                spilled.append((nm, path, len(df_)))
+            else:
+                df_.to_excel(w, sheet_name=nm, index=False)
+                saved.append(nm)
+    print(f"\n[저장] {SAVE_XLSX}  (시트: {' / '.join(saved)})")
+    for nm, path, n in spilled:
+        print(f"        '{nm}' 는 {n:,}행이라 엑셀 한 시트에 안 들어간다 -> {path}")
 
     try:
         plot(L1, F, SCdf, agg, teams)
