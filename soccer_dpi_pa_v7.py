@@ -90,6 +90,31 @@ BALL_MAX_GAP = None      # 공 좌표가 이 프레임 수 이하로 끊기면 �
 PLAYER_MAX_GAP = None    # 선수 좌표도 같은 방식으로 메운다. None 이면 0.3초.
                          # 선수는 공보다 느리고 부드러워서 더 길게 잡아도 안전하다.
 
+ROLE_GK_IDS  = set()     # 역할 열에서 읽어낸 골키퍼 id (read_data 가 채운다)
+BALL_REJECTED = (0, 0)   # (믿은 공 프레임, 물리 검사로 버린 공 프레임)
+
+# ── 공 검출 품질 ────────────────────────────────────────────────
+#  검출 단계에서 걸러내도 공 오검출은 남는다. 실측 보고 기준으로 공 행의
+#  약 5%가 페널티 마크·몸을 굽힌 흰 유니폼 선수·사진기자석이었다.
+#  이런 가짜 공은 기여도에 두 가지로 새어 든다.
+#    · 그 지점에서 제일 가까운 선수가 '볼 소유자'가 된다
+#    · 위험도 가중치(LAMBDA_BALL)의 중심이 엉뚱한 곳에 박힌다
+#  아래 두 규칙은 검출기가 못 거른 나머지를 좌표만으로 걸러낸다.
+BALL_MIN_CONF = 0.0      # 공 신뢰도 열(conf)이 있으면 이 값 미만은 버린다. 0 이면 끔.
+BALL_SPEED_MAX = 40.0    # 공이 이 속도(m/s)를 넘게 '순간이동'하면 그 프레임은 안 믿는다
+                         #   강한 슛이 35 m/s 안팎이므로 40 m/s(=144 km/h)는 넉넉한 상한이다.
+                         #   검출이 진짜 공과 가짜 공 사이를 오갈 때 이 값이 튄다.
+BALL_FROZEN_M = 0.3      # 이만큼도 안 움직인 상태가
+BALL_FROZEN_S = 2.0      # 이 시간(초) 넘게 이어지면 '얼어붙은 공'으로 본다
+                         #   페널티 마크 오검출은 제자리에 붙어 있다. 진짜 공이
+                         #   2초 넘게 완전히 멈춰 있다면 그것은 경기가 멈춘 시간이므로,
+                         #   어느 쪽이든 기여도를 매길 구간이 아니다.
+                         #   0 이면 이 검사를 끈다.
+AUDIT_MIN_GAP_S = 5.0    # 표본검사에서 뽑는 장면들 사이의 최소 간격(초)
+BALL_ID_BASE = 1_000_000 # track_id 가 이 값 이상이면 공으로 본다.
+                         #   공 전용 모델을 쓰는 파이프라인은 선수 추적기 번호와
+                         #   겹치지 않게 공 id 를 100만번대부터 매기는 관례가 있다.
+
 BALL_AIRBORNE_Z = 1.5    # 공 높이(m) 열(ball_z)이 있을 때, 이보다 높으면 '공중볼'로 본다.
                          # 크로스·롱볼·헤더 상황에서는 공의 지면 투영 좌표에 가장 가까운
                          # 선수가 실제로는 그 공을 다룰 수 없다(점프/타이밍 문제라 2D 거리로
@@ -212,6 +237,8 @@ ALIAS = {
     "ball_x":   ["ball_x", "ballx", "bx", "공x", "공_x"],
     "ball_y":   ["ball_y", "bally", "by", "공y", "공_y"],
     "ball_z":   ["ball_z", "ballz", "bz", "ball_height", "ball_h", "공z", "공높이", "공_z"],
+    "conf":     ["conf", "confidence", "score", "prob", "probability", "신뢰도", "확률"],
+    "role":     ["role", "역할", "position_role", "obj_class", "objclass"],
 }
 import re as _re
 def _norm(s):
@@ -272,14 +299,66 @@ def find_height_col(df):
 
 BALL_WORDS = ("ball", "공", "볼")
 
+#  검출기가 역할을 따로 내주면 그것을 쓴다. 추정보다 항상 낫다.
+#    검출 파이프라인이 선수/심판/골키퍼를 별개 클래스로 내보내는 경우가 있는데,
+#    예전 필터는 'person|player|선수' 만 남겨서 '골키퍼'·'goalkeeper' 행을
+#    통째로 버렸다. 그러면 팀당 인원이 한 명씩 줄고(경고도 안 뜬다),
+#    골문 앞 공간을 골키퍼 대신 센터백이 받아 SC 가 부풀려진다.
+GK_WORDS   = ("골키퍼", "goalkeeper", "goalie", "keeper", "gk", "수문장")
+REF_WORDS  = ("심판", "부심", "주심", "대기심", "referee", "refere", "ref",
+              "umpire", "linesman", "assistant referee", "official")
+PLAYER_WORDS = ("선수", "player", "person", "outfield")
+
+
+def _match_words(series, words):
+    """열 값이 주어진 단어 중 하나를 담고 있는 행을 찾는다."""
+    s = series.astype(str).str.lower().str.strip()
+    m = pd.Series(False, index=series.index)
+    for w in words:
+        m = m | s.str.contains(_re.escape(w.lower()), na=False, regex=True)
+    return m
+
+
+def classify_roles(tracks):
+    """
+    역할 열(cls/kind/role)에서 골키퍼·심판·선수를 가려낸다.
+
+    반환: (선수로 볼 행 마스크, 골키퍼 track_id 집합, 심판 행 수, 쓴 열 이름)
+    아무 열도 역할을 담고 있지 않으면 (전부 True, 빈 집합, 0, None) 이다.
+    """
+    for col in ("role", "cls", "kind", "position"):
+        if col not in tracks.columns:
+            continue
+        is_gk = _match_words(tracks[col], GK_WORDS)
+        is_ref = _match_words(tracks[col], REF_WORDS)
+        is_pl = _match_words(tracks[col], PLAYER_WORDS)
+        # 'referee' 안에 'ref' 가 들어가듯 단어가 서로 겹치므로 골키퍼를 우선한다.
+        is_ref = is_ref & ~is_gk
+        if not (is_gk.any() or is_ref.any()):
+            continue                       # 이 열은 역할 정보가 아니다
+        keep = (is_pl | is_gk) & ~is_ref
+        if not keep.any():                 # 선수 단어가 아예 없으면 심판만 뺀다
+            keep = ~is_ref
+        gk_ids = set(tracks.loc[is_gk & keep, "track_id"].unique()) \
+            if "track_id" in tracks.columns else set()
+        return keep, gk_ids, int(is_ref.sum()), col
+    return pd.Series(True, index=tracks.index), set(), 0, None
+
 
 def _is_ball(series):
-    """어느 열에 있든 'ball' 로 표시된 행을 찾는다."""
+    """
+    어느 열에 있든 'ball' 로 표시된 행을 찾는다.
+
+    track_id 가 100만 이상인 것도 공으로 본다. 공 전용 모델을 따로 돌리는
+    파이프라인은 선수 추적기의 번호와 겹치지 않게 공 id 를 100만번대부터
+    매기는데, 그 경우 클래스 이름이 따로 안 붙어 오기도 한다.
+    """
     s = series.astype(str).str.lower().str.strip()
-    m = False
+    m = pd.Series(False, index=series.index)
     for w in BALL_WORDS:
         m = m | (s == w) | s.str.fullmatch(rf"{w}\d*", na=False)
-    return m
+    num = pd.to_numeric(series, errors="coerce")
+    return m | (num >= BALL_ID_BASE).fillna(False)
 
 
 def load_table(path, sheet):
@@ -464,10 +543,11 @@ def read_data():
         # 높이를 통째로 버려서, 같은 데이터인데 입력 형식만 다르면 공중볼
         # 처리가 조용히 무력화됐다.
         zc = find_height_col(b)
+        extra = ([zc] if zc else []) + (["conf"] if "conf" in b.columns else [])
         if {"ball_x", "ball_y"} <= set(b.columns):
-            ball = b[["frame", "ball_x", "ball_y"] + ([zc] if zc else [])]
+            ball = b[["frame", "ball_x", "ball_y"] + extra]
         else:
-            ball = b[["frame", "X", "Y"] + ([zc] if zc else [])].rename(
+            ball = b[["frame", "X", "Y"] + extra].rename(
                 columns={"X": "ball_x", "Y": "ball_y"})
         if zc:
             ball = ball.rename(columns={zc: "ball_z"})
@@ -475,7 +555,7 @@ def read_data():
     elif {"ball_x", "ball_y"} <= set(tracks.columns):
         bcols = ["ball_x", "ball_y"] + (["ball_z"] if "ball_z" in tracks.columns else [])
         ball = tracks.groupby("frame")[bcols].first().reset_index()
-        tracks = tracks.drop(columns=bcols)
+        tracks = tracks.drop(columns=bcols)   # conf 는 선수 행의 것이라 안 가져온다
         how = "ball_x / ball_y 열"
     else:
         # cls, team, track_id, kind 중 아무 열에서나 'ball' 표시를 찾는다
@@ -484,7 +564,8 @@ def read_data():
                 m = _is_ball(tracks[col])
                 if m.any():
                     zc = find_height_col(tracks)        # 공 행의 z 는 높이다
-                    take = ["X", "Y"] + ([zc] if zc else [])
+                    take = ["X", "Y"] + ([zc] if zc else []) \
+                           + (["conf"] if "conf" in tracks.columns else [])
                     ball = (tracks[m].groupby("frame")[take].first()
                             .rename(columns={"X": "ball_x", "Y": "ball_y"}).reset_index())
                     if zc:
@@ -501,6 +582,13 @@ def read_data():
             "  (b) cls / team / track_id 열에 'ball' 인 행\n"
             "  (c) SHEET_BALL 에 공 시트 이름 지정\n"
             f"실제 열: {list(tracks.columns)}")
+    # 공 신뢰도가 있으면 낮은 것부터 버린다. 검출기가 내준 확신을 안 쓸 이유가 없다.
+    if BALL_MIN_CONF > 0 and "conf" in ball.columns:
+        n0 = len(ball)
+        ball = ball[ball["conf"].fillna(1.0) >= BALL_MIN_CONF]
+        if len(ball) < n0:
+            print(f"  공 신뢰도 {BALL_MIN_CONF} 미만 {n0-len(ball)}프레임 제외 "
+                  f"({(n0-len(ball))/max(n0,1)*100:.0f}%)")
     if "ball_z" in ball.columns:
         hi = float((ball["ball_z"].fillna(0) > BALL_AIRBORNE_Z).mean())
         print(f"  공 좌표: {how} 에서 {len(ball)} 프레임분 , 높이 열 있음 "
@@ -515,9 +603,17 @@ def read_data():
         raise SystemExit(f"필수 열이 없다: {miss}\n실제 열: {list(tracks.columns)}\n"
                          "ALIAS 딕셔너리에 실제 열 이름을 추가하면 인식된다.")
 
-    if "cls" in tracks.columns:
-        keep = tracks["cls"].astype(str).str.lower().str.contains("person|player|선수", na=True)
+    global ROLE_GK_IDS
+    keep, role_gks, n_ref, role_col = classify_roles(tracks)
+    ROLE_GK_IDS = role_gks
+    if role_col is not None:
+        print(f"  역할 열 '{role_col}' 인식: 골키퍼 {len(role_gks)}명 / "
+              f"심판 {n_ref}행 제외 / 남긴 행 {int(keep.sum()):,}")
         tracks = tracks[keep].copy()
+    elif "cls" in tracks.columns:
+        # 역할 정보가 없는 cls 열이면 예전처럼 사람 행만 남긴다.
+        m = tracks["cls"].astype(str).str.lower()
+        tracks = tracks[m.str.contains("person|player|선수", na=True)].copy()
 
     tracks = tracks.dropna(subset=["frame", "track_id", "X", "Y"])
     tracks["frame"] = tracks["frame"].astype(int)
@@ -799,9 +895,47 @@ def fill_ball_gaps(ball, frames, max_gap=None):
     return b.dropna(subset=["ball_x", "ball_y"]).reset_index()
 
 
+def ball_plausibility(ball):
+    """
+    좌표만 보고 '이건 공일 리 없다' 는 프레임을 표시한다.
+
+    검출 단계를 아무리 조여도 공 오검출은 남는다. 남는 것들의 성질이 분명하다.
+      · 페널티 마크 — 제자리에 붙어 있다 (얼어붙음)
+      · 검출이 진짜 공과 가짜 공을 오갈 때 — 좌표가 한 프레임에 수십 m 튄다
+    둘 다 물리로 잘라낼 수 있고, 새로 정할 임계값도 사실상 없다
+    (공의 최고 속도, '멈춰 있다'의 정의).
+
+    얼어붙은 공은 가짜이거나, 진짜라면 경기가 멈춘 시간이다. 어느 쪽이든
+    기여도를 매길 구간이 아니므로 똑같이 뺀다.
+
+    반환에 ball_bad 열(믿지 않을 행)이 붙는다.
+    """
+    b = ball.sort_values("frame").reset_index(drop=True).copy()
+    bad = pd.Series(False, index=b.index)
+
+    step = np.hypot(b.ball_x.diff(), b.ball_y.diff())
+    dt = b.frame.diff() / FPS
+    if BALL_SPEED_MAX > 0:
+        v = (step / dt).replace([np.inf, -np.inf], np.nan)
+        bad |= (v > BALL_SPEED_MAX).fillna(False)
+
+    if BALL_FROZEN_M > 0 and BALL_FROZEN_S > 0:
+        # '거의 안 움직인' 구간을 이어 붙여 길이를 잰다
+        still = (step <= BALL_FROZEN_M).fillna(False)
+        grp = (~still).cumsum()
+        span = b.frame.groupby(grp).transform(lambda f: f.max() - f.min())
+        bad |= still & (span >= BALL_FROZEN_S * FPS)
+
+    b["ball_bad"] = bad
+    return b
+
+
 def build_frames_table(tracks, ball, teams):
+    global BALL_REJECTED
     frames = np.sort(tracks["frame"].unique())
-    ball = fill_ball_gaps(ball, frames)
+    ball = ball_plausibility(ball)
+    BALL_REJECTED = (int((~ball.ball_bad).sum()), int(ball["ball_bad"].sum()))
+    ball = fill_ball_gaps(ball[~ball.ball_bad].drop(columns=["ball_bad"]), frames)
 
     m = tracks.merge(ball, on="frame", how="inner")
     m["d_ball"] = np.hypot(m.X - m.ball_x, m.Y - m.ball_y)
@@ -1305,7 +1439,18 @@ def mean_dist_own_goal(tracks, teams):
 
 
 def detect_goalkeepers(dist_goal, tracks, teams):
-    """팀마다 자기 골대에 가장 붙어 있는 한 명을 골키퍼로 본다."""
+    """
+    골키퍼를 정한다. 우선순위는 직접 지정 > 검출기의 역할 라벨 > 위치 추정이다.
+
+    검출기가 골키퍼를 따로 내주면 그것을 쓴다. 위치로 추정하는 것은
+    '자기 골대에 제일 가까운 한 명'이라는 가정이라, 팀이 올라가 있는
+    짧은 구간에서는 틀리거나 한쪽만 찾는다.
+    """
+    if GK_IDS is None and ROLE_GK_IDS:
+        have = set(dist_goal.index)
+        keep = {i for i in ROLE_GK_IDS if i in have}
+        if keep:
+            return keep
     if GK_IDS is not None:
         # 직접 지정한 id 는 실제 데이터에 있는 것만 쓴다. 오타가 있거나
         # ID 재연결(repair_ids)이 이름을 바꿔 놓았으면 없는 id 가 되는데,
@@ -1430,6 +1575,54 @@ def total_contribution(agg, tracks, teams):
     return a
 
 
+# ══════════════ 5e. 표본 검사용 목록 ══════════════
+def audit_frames(M, top_n=5):
+    """
+    선수마다 점수를 가장 많이 끌어올린 프레임을 뽑아 영상 시각과 함께 남긴다.
+
+    집계값만 보면 그 값이 어디서 왔는지 알 수 없다. 검출 오류는 평균 뒤에
+    숨고, 평균은 조용히 거짓말을 한다. 오검출을 실제로 찾아내는 방법은
+    통계가 아니라 '하나씩 잘라서 눈으로 보는 것' 이다.
+
+    그래서 상위 기여 프레임의 시각(mm:ss)을 뽑아 준다. 영상에서 그 지점을
+    열어 '이 순간이 정말 그 선수의 기여였나' 를 몇 개만 확인하면, 표 전체를
+    믿어도 되는지 금방 알 수 있다.
+    """
+    if not len(M):
+        return pd.DataFrame()
+    rows = []
+    for metric in ("SC", "PR", "PA"):
+        if metric not in M.columns:
+            continue
+        d = M[M[metric].notna()]
+        if not len(d):
+            continue
+        gap = AUDIT_MIN_GAP_S * FPS
+        for tid, g in d.groupby("track_id", sort=False):
+            # 같은 장면의 연속 프레임을 여러 개 뽑으면 점검이 안 된다. 하나 고르면
+            # 그 앞뒤 몇 초는 건너뛰고 다음을 고른다 — 서로 다른 순간이 나와야 한다.
+            picked = []
+            for _, r in g.sort_values(metric, ascending=False).iterrows():
+                if any(abs(int(r["frame"]) - q) < gap for q in picked):
+                    continue
+                picked.append(int(r["frame"]))
+                t = float(r["time_s"]) if ("time_s" in r and pd.notna(r["time_s"])) \
+                    else float(r["frame"]) / FPS
+                rows.append({"track_id": tid, "지표": metric,
+                             "값": round(float(r[metric]), 4),
+                             "frame": int(r["frame"]),
+                             "시각": f"{int(t)//60:02d}:{int(t)%60:02d}",
+                             "공까지거리": (round(float(r["d"]), 1)
+                                       if ("d" in r and pd.notna(r["d"])) else np.nan)})
+                if len(picked) >= top_n:
+                    break
+    if not rows:
+        return pd.DataFrame()
+    return (pd.DataFrame(rows)
+            .sort_values(["지표", "track_id", "값"], ascending=[True, True, False])
+            .reset_index(drop=True))
+
+
 # ══════════════ 6. 자체 검증 ══════════════
 def self_test():
     print("\n[검증] 계산이 정의대로 되는지 확인")
@@ -1501,6 +1694,27 @@ def self_test():
            and find_height_col(_cols("frame", "X", "Y")) is None
            and find_height_col(_cols("frame", "Z", "ball_z")) == "ball_z")
 
+    # 역할 열: 골키퍼는 남기고 심판은 뺀다. 'referee' 안의 'ref' 가 'goalkeeper' 를
+    # 잡아먹지 않아야 한다. 예전 필터는 골키퍼 행을 통째로 버렸다.
+    rt = pd.DataFrame({"track_id": ["p1", "gk1", "r1", "p2", "gk2"],
+                       "cls": ["선수", "골키퍼", "심판", "player", "goalkeeper"]})
+    keep_r, gks_r, nref_r, col_r = classify_roles(rt)
+    c11 = (col_r == "cls" and nref_r == 1 and gks_r == {"gk1", "gk2"}
+           and list(keep_r) == [True, True, False, True, True])
+
+    # 공 물리 검사: 제자리에 붙어 있는 것과 순간이동은 공이 아니다.
+    old3, FPS = FPS, fps
+    # 앞 60프레임은 정상 주행, 뒤 120프레임(=4초)은 제자리에 붙어 있다.
+    # 고정 구간은 BALL_FROZEN_S 보다 확실히 길어야 검사에 걸린다.
+    bx = np.r_[np.linspace(10, 40, 60), np.full(120, 94.0)]
+    bt = pd.DataFrame({"frame": np.arange(180), "ball_x": bx, "ball_y": 34.0})
+    pl = ball_plausibility(bt)
+    c12a = (not pl.ball_bad[:55].any()) and pl.ball_bad[100:].all()
+    bt2 = pd.DataFrame({"frame": [0, 1, 2], "ball_x": [10.0, 12.0, 90.0], "ball_y": 34.0})
+    c12b = bool(ball_plausibility(bt2).ball_bad.iloc[2])        # 78 m 이동 = 순간이동
+    FPS = old3
+    c12 = c12a and c12b
+
     for nm, c in [("등속 5.00 m/s 정확", c1), ("추적 끊김 구간 NaN", c2),
                   ("team 열 통과", c3), (f"효율성 공리 (오차 {abs(sc.sum()-tot):.0e})", c4),
                   (f"협력 수비 보존 ({s2[0]:.0f} vs {s2[1]:.0f})", c5),
@@ -1508,9 +1722,11 @@ def self_test():
                   (f"먼 거리 복귀주력은 압박 아님 (근접 {near:.3f} vs 원거리 {far:.3f})", c7),
                   ("라인 밖 사람이 있어도 원점 판정 유지", c8),
                   ("ID 재연결이 순간이동을 잇지 않음", c9),
-                  ("공 높이 열 인식 (ball_z / Z / 없음)", c10)]:
+                  ("공 높이 열 인식 (ball_z / Z / 없음)", c10),
+                  ("역할 열: 골키퍼 유지 · 심판 제외", c11),
+                  ("공 물리 검사: 고정·순간이동 걸러냄", c12)]:
         print(f"  {'PASS' if c else '**FAIL**':9s} {nm}")
-    if not all([c1, c2, c3, c4, c5, c6, c7, c8, c9, c10]):
+    if not all([c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12]):
         raise SystemExit("검증 실패. 아래 결과를 믿으면 안 된다.")
 
 
@@ -1537,6 +1753,14 @@ def main():
     if cov0 < 0.7:
         print(f"    ! 공 검출이 {(1-cov0)*100:.0f}% 끊겼다. 보간으로 메울 수 있는 건 짧은 구간뿐이라"
               " 긴 구간은 그대로 버려진다. 공 검출부터 개선할 것.")
+    keptb, badb = BALL_REJECTED
+    if badb:
+        print(f"  공품질  물리 검사로 {badb}프레임 제외 "
+              f"(순간이동 {BALL_SPEED_MAX:.0f} m/s 초과 · {BALL_FROZEN_S:.0f}초 넘게 얼어붙음)"
+              f" -> 남은 공 프레임 {keptb}")
+        if badb > 0.2 * (keptb + badb):
+            print(f"    ! 공 프레임의 {badb/(keptb+badb)*100:.0f}% 가 물리적으로 말이 안 된다."
+                  f" 공 검출에 페널티 마크 같은 고정 오검출이 섞여 있을 수 있다.")
     if "ball_out" in F.columns and F["ball_out"].any():
         print(f"  데드볼  공이 라인 밖인 프레임 {F['ball_out'].mean()*100:.0f}% "
               f"— 경기가 멈춘 시간이라 소유자를 두지 않는다")
@@ -1654,7 +1878,8 @@ def main():
         agg.reset_index().to_excel(w, sheet_name="선수별", index=False)
         saved.append("선수별")
         for nm, df_ in (("프레임별", M), ("프레임메타", F),
-                        ("PA프레임별", PAdf), ("검출된패스", passes)):
+                        ("PA프레임별", PAdf), ("검출된패스", passes),
+                        ("표본검사", audit_frames(M))):
             if not len(df_):
                 continue
             if len(df_) > XLSX_MAX_ROWS:
