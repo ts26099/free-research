@@ -1632,10 +1632,16 @@ def self_test():
                       "X": 5.0 * f / fps, "Y": 0.0})
     global FPS
     old, FPS = FPS, fps
-    v = calculate_velocity(d)
+    #  검증은 '함수가 정의대로 도는가' 를 봐야지 사용자의 DELTA 설정에 딸려
+    #  가면 안 된다. 예전에는 delta 를 전역값으로 두어서, 10 Hz 데이터에 맞게
+    #  DELTA=1 로 바꾼 사람은 멀쩡한 설정인데도 검증 실패로 실행 자체가 막혔다.
+    dlt = 3
+    v = calculate_velocity(d, delta=dlt)
     FPS = old
     c1 = np.allclose(v[(v.frame >= 40) & (v.frame <= 45)].speed, 5.0, atol=1e-6)
-    c2 = v[(v.frame >= 9) & (v.frame <= 11)].speed.isna().all()
+    # 구멍(12~20 프레임)을 중앙차분 창이 걸치는 구간은 속도가 비어야 한다.
+    hole = range(12 - dlt, 12)
+    c2 = v[v.frame.isin(hole)].speed.isna().all()
     c3 = "team" in v.columns
 
     grid, area = make_grid(1.0)
