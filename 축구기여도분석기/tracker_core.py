@@ -413,6 +413,15 @@ class Config:
     ball_focus_hold_sec: float = 2.0
     ball_focus_ratio_scale: float = 0.82
 
+    # --- 전체화면 공 패스를 건너뛰기 ---------------------------------------
+    # 공을 이미 쫓고 있는 동안에는 확대 창(480px)만으로 충분하다. 실측(898장,
+    # CPU)에서 공 프레임의 75%(669/891)가 확대 창에서 나왔고, 전체화면 1920px
+    # 패스는 한 장에 330ms 로 전체 시간의 절반을 넘게 먹었다.
+    # 그래서 '쫓고 있는 동안'에는 ball_full_every 장에 한 번만 전체화면을 본다
+    # (놓친 공을 다시 찾기 위한 그물). 공을 놓친 상태면 매번 전체화면을 본다.
+    # 0 으로 두면 예전처럼 항상 전체화면을 본다.
+    ball_full_every: int = 6
+
     # 경기장에 공은 하나뿐이다. 후보가 여럿이면 하나만 남긴다.
     # 직전 위치에서 이어지는 쪽을 고른다 — 페널티 마크는 제자리에 붙어
     # 있고 진짜 공은 매끄럽게 움직이므로, 둘 다 보일 때 공이 이긴다.
@@ -1859,6 +1868,7 @@ def analyze(
     ball_seen = 0        # 공 모델이 내놓은 후보 총수 (밝기 경고 판단용)
     ball_still = 0       # 멈춰 있어서 밝기 면제를 못 받은 후보 수 (페널티 마크 등)
     ball_focus_calls = 0 # 주시 확대를 돌린 횟수
+    ball_full_calls = 0  # 전체화면 공 패스를 돌린 횟수
     ball_from_focus = 0  # 확대 창에서 찾아 최종 공이 된 프레임 수
     # 원본 프레임 -> 그 프레임에서 공 모델이 본 후보 자리들 (멈춤 판정용)
     ball_hist: dict[int, list] = {}
@@ -1961,12 +1971,20 @@ def analyze(
                 if start > 0:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, start)
                 idx = start
+                step = max(1, int(cfg.vid_stride))
                 while hi_frame is None or idx <= hi_frame:
+                    if idx % step:
+                        # 쓰지 않을 프레임은 grab() 만 한다. read() 와 달리
+                        # 화면을 만들어내지 않아서(디코드 생략) 거의 공짜다.
+                        # stride 2 에서 디코드가 절반으로 준다.
+                        if not cap.grab():
+                            break
+                        idx += 1
+                        continue
                     okay, img = cap.read()
                     if not okay:
                         break
-                    if idx % cfg.vid_stride == 0:
-                        yield idx, model.track(img, persist=True, **common)[0]
+                    yield idx, model.track(img, persist=True, **common)[0]
                     idx += 1
             finally:
                 cap.release()
@@ -2116,16 +2134,30 @@ def analyze(
             # 주 모델과 같은 프레임을 따로 한 번 더 본다. 공만 학습한 모델이라
             # 작은 공을 훨씬 잘 찾는다. 추적은 ByteTrack 대신 BallPicker 가
             # 맡는다 — 공은 하나뿐이라 그 편이 확실하다.
+            #
+            # 다만 전체화면을 1920px 로 보는 건 한 장에 330ms 로 이 루프에서
+            # 가장 비싼 한 줄이다. 공을 이미 쫓고 있는 동안에는 아래의 확대
+            # 창(480px→960)만으로 대개 충분하므로 (실측 공 프레임의 75%가
+            # 확대 창에서 나왔다) ball_full_every 장에 한 번만 전체화면을
+            # 본다. 공을 놓쳤으면 다시 찾아야 하니 매번 본다.
             if ball_model is not None and frame_img is not None:
-                try:
-                    bres = ball_model.predict(frame_img, imgsz=int(cfg.ball_imgsz),
-                                              conf=float(cfg.ball_conf),
-                                              verbose=False)[0]
-                except Exception as exc:  # noqa: BLE001 — 한 프레임 실패로 멈추지 않는다
-                    if ball_errors == 0:
-                        log(f"  공 모델 추론 실패 (이후 생략): {exc}")
-                    ball_errors += 1
-                    bres = None
+                # 공을 쫓고 있는 중인가 — 그렇다면 확대 창만으로 대개 충분하다.
+                on_ball = (focus_on and ball_picker.last is not None
+                           and src_frame - ball_picker.last_frame <= focus_hold)
+                every = int(cfg.ball_full_every)
+                do_full = (not on_ball) or every <= 0 or (frame_idx % every == 0)
+                bres = None
+                if do_full:
+                    ball_full_calls += 1
+                    try:
+                        bres = ball_model.predict(frame_img, imgsz=int(cfg.ball_imgsz),
+                                                  conf=float(cfg.ball_conf),
+                                                  verbose=False)[0]
+                    except Exception as exc:  # noqa: BLE001 — 한 프레임 실패로 멈추지 않는다
+                        if ball_errors == 0:
+                            log(f"  공 모델 추론 실패 (이후 생략): {exc}")
+                        ball_errors += 1
+                        bres = None
                 cands = []
                 seen_now: list[tuple[float, float]] = []
                 raw_now: list[tuple] = []
@@ -2352,6 +2384,7 @@ def analyze(
         "ball_candidates": ball_seen,
         "ball_still_rejected": ball_still,
         "ball_focus_calls": ball_focus_calls,
+        "ball_full_calls": ball_full_calls,
         "ball_frames_from_focus": ball_from_focus,
         "ball_chain_replaced": chain_replaced,
         "ball_chain_added": chain_added,
@@ -2412,6 +2445,9 @@ def analyze(
                 f" 어두우면 config.json 의 ball_min_bright 를 낮추거나 0 으로 끄세요.")
     if ball_focus_calls:
         log(f"  주시 확대 {ball_focus_calls:,}번 · 그중 확대 창에서 찾은 공 {ball_from_focus:,}장")
+        if int(cfg.ball_full_every) > 0:
+            log(f"  전체화면 공 패스 {ball_full_calls:,}번 "
+                f"(공을 쫓는 동안에는 {cfg.ball_full_every}장에 한 번만 — 시간을 아낀다)")
     if ball_ragged:
         log(f"  모양이 공이 아니라서 뺀 후보 {ball_ragged:,}건 (축구화·흰 스타킹)")
     if ball_errors:

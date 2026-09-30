@@ -37,6 +37,7 @@ import autocalib
 import autotrack
 import diagnose
 import pipeline
+import stitch
 
 ROOT = Path(__file__).resolve().parent
 ENGINE = ROOT / "soccer_ipi_v8.py"
@@ -52,13 +53,21 @@ ACCENT = "#4c8dff"
 OKC = "#5fd08a"
 WARN = "#ffb35c"
 
+# 고급 설정의 '분석 속도' — 화면 글자 <-> autotrack.SPEED_PRESETS 의 키
+SPEED_LABEL = {"auto": "자동", "fast": "빠르게",
+               "balanced": "보통", "accurate": "정확하게"}
+SPEED_KEY = {v: k for k, v in SPEED_LABEL.items()}
+
+CONFIG_REV = 2          # 설정 파일 손질 판 번호 (load_config 참고)
+
 DEFAULTS = {
     "pitch_l": 105.0, "pitch_w": 68.0, "team_size": 0,     # 0 = 자동
-    "from_sec": "", "to_sec": "", "save_video": True,
+    "from_sec": "", "to_sec": "", "save_video": False,
+    "speed": "auto", "stitch": True,
     "norm": "z", "exclude_gk": True, "pos_adjust": True, "pa_learn": True,
     "spec_pv_prox": False, "spec_prog_goaldist": False,
     "manual_src": None, "manual_dst": None,                # 손으로 보정했을 때만
-    "results_dir": str(RESULTS_DIR),
+    "results_dir": str(RESULTS_DIR), "config_rev": 0,
 }
 
 
@@ -85,8 +94,15 @@ def load_config() -> dict:
                 for k, v in data.items():
                     if k in cfg:
                         cfg[k] = v
+            # 예전 설정을 한 번만 손본다. 확인용 영상은 기본이 '켬' 이었는데,
+            # 이게 분석이 끝난 뒤 영상을 통째로 다시 인코딩하는 단계라 시간을
+            # 크게 먹는다. 일부러 켠 사람이 아니라 기본값 그대로 쓰던 사람은
+            # 여기서 꺼 준다. 다시 켜면 그 뒤로는 그대로 둔다.
+            if isinstance(data, dict) and "config_rev" not in data:
+                cfg["save_video"] = False
         except (json.JSONDecodeError, OSError):
             pass
+    cfg["config_rev"] = CONFIG_REV
     return cfg
 
 
@@ -294,6 +310,20 @@ class App:
         ttk.Label(a1, text="예 12:00 ~ 15:00 · 비우면 전체",
                   style="Muted.TLabel").grid(row=0, column=11, sticky="w")
 
+        a15 = ttk.Frame(self.adv)
+        a15.pack(fill="x", pady=2)
+        ttk.Label(a15, text="분석 속도").pack(side="left")
+        self.speed_var = tk.StringVar(
+            value=SPEED_LABEL.get(self.cfg.get("speed", "auto"), "자동"))
+        ttk.Combobox(a15, textvariable=self.speed_var, width=8, state="readonly",
+                     values=list(SPEED_LABEL.values())).pack(side="left", padx=(6, 8))
+        ttk.Label(a15, text="자동 = GPU 있으면 정확하게 · 없으면 보통. "
+                            "빠르게는 3배 빠르고 먼 선수를 조금 더 놓친다",
+                  style="Muted.TLabel").pack(side="left")
+        self.stitch_var = tk.BooleanVar(value=self.cfg.get("stitch", True))
+        ttk.Checkbutton(a15, text="끊어진 ID 잇기", variable=self.stitch_var
+                        ).pack(side="right")
+
         a2 = ttk.Frame(self.adv)
         a2.pack(fill="x", pady=2)
         self.vid_var = tk.BooleanVar(value=self.cfg["save_video"])
@@ -302,7 +332,7 @@ class App:
         self.learn_var = tk.BooleanVar(value=self.cfg["pa_learn"])
         self.sw1_var = tk.BooleanVar(value=self.cfg["spec_pv_prox"])
         self.sw2_var = tk.BooleanVar(value=self.cfg["spec_prog_goaldist"])
-        for text, var in (("박스 그린 확인용 영상", self.vid_var),
+        for text, var in (("박스 그린 확인용 영상 (느려짐)", self.vid_var),
                           ("골키퍼 제외", self.gk_var),
                           ("포지션 보정", self.pos_var),
                           ("PA 지수 학습", self.learn_var)):
@@ -463,6 +493,8 @@ class App:
             "save_video": self.vid_var.get(), "exclude_gk": self.gk_var.get(),
             "pos_adjust": self.pos_var.get(), "pa_learn": self.learn_var.get(),
             "spec_pv_prox": self.sw1_var.get(), "spec_prog_goaldist": self.sw2_var.get(),
+            "speed": SPEED_KEY.get(self.speed_var.get(), "auto"),
+            "stitch": self.stitch_var.get(),
         })
         save_config(self.cfg)
         return self.cfg
@@ -513,6 +545,7 @@ class App:
                 if self.stop_flag.is_set():
                     break
                 H, calib_note = self._calibrate(video, csv_path, cfg)
+                csv_path = self._stitch(csv_path, cfg, H)
                 if self._analyze(csv_path, cfg, out_dir, H, calib_note):
                     done += 1
             except Exception as exc:                          # noqa: BLE001
@@ -541,7 +574,8 @@ class App:
             log=lambda m: self.q.put(("log", "  " + str(m))),
             on_progress=lambda c, t, e=0.0: self.q.put(("stage", "영상 분석", c, max(t, 1))),
             should_stop=self.stop_flag.is_set,
-            start_sec=lo, end_sec=hi, save_video=bool(cfg.get("save_video", True)))
+            start_sec=lo, end_sec=hi, save_video=bool(cfg.get("save_video", False)),
+            speed=str(cfg.get("speed", "auto")))
         if self.stop_flag.is_set():
             self.q.put(("log", "  중지했습니다.", "warn"))
             return None
@@ -591,6 +625,37 @@ class App:
         if note:
             self.q.put(("log", "  " + note, "warn"))
         return H, f"{how} (점수 {score:.2f})"
+
+    # ------------------------------------------------ 2.5단계 · ID 손질
+    def _stitch(self, csv_path: Path, cfg, H):
+        """
+        끊어진 추적 ID 를 잇고, 사람이 아닌 트랙을 버린다.
+
+        보정(H) 뒤에 한다. 픽셀 거리로는 먼 선수와 가까운 선수의 '1px'가
+        6배까지 차이 나서 이어붙일지 말지를 정할 수 없다. 보정에 실패해
+        H 가 없으면 이 단계는 건너뛴다 — 그때는 어차피 기여도 값 자체가
+        의미가 없으니 손질해 봐야 소용이 없다.
+        """
+        if H is None or not cfg.get("stitch", True):
+            return csv_path
+        self.q.put(("log", "  끊어진 추적 ID 를 잇는 중", "head"))
+        try:
+            new_path, rep = stitch.stitch(
+                csv_path, H, float(cfg["pitch_l"]), float(cfg["pitch_w"]),
+                log=lambda m: self.q.put(("log", "  " + str(m))))
+        except Exception as exc:                              # noqa: BLE001
+            self.q.put(("log", f"  손질을 건너뜁니다 ({type(exc).__name__}: {exc})", "warn"))
+            return csv_path
+        size = int(cfg["team_size"]) or 11
+        want = size * 2 + 2                  # 양 팀 + 골키퍼 둘
+        if rep["after"] > want * 2:
+            self.q.put(("log",
+                f"  ! 손질 뒤에도 ID 가 {rep['after']}개다 (선수는 {want}명 안팎이어야 한다). "
+                f"한 사람이 여러 번호로 쪼개져 있어 점수가 흩어진다 — "
+                f"[고급 설정] 에서 해상도를 올리거나 구간을 짧게 나눠 보라.", "warn"))
+        elif rep["merged"] or rep["rows_dropped"]:
+            self.q.put(("log", f"  손질 완료 — ID {rep['before']}개 -> {rep['after']}개", "ok"))
+        return new_path
 
     # ----------------------------------------------------- 3단계 · 기여도
     def _analyze(self, csv_path: Path, cfg, out_dir: Path, H, calib_note) -> bool:

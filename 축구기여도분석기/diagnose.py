@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import platform
+import os
 import sys
 import tempfile
 import zipfile
@@ -39,6 +40,11 @@ def _versions() -> str:
     try:
         import torch
         out.append(f"CUDA 사용가능 {torch.cuda.is_available()}")
+        out.append(f"torch 스레드  {torch.get_num_threads()}")
+    except Exception:                # noqa: BLE001
+        pass
+    try:
+        out.append(f"CPU 코어     {os.cpu_count()}")
     except Exception:                # noqa: BLE001
         pass
     return "\n".join(out)
@@ -182,7 +188,7 @@ def _clip(video: Path, tmp: Path, log, seconds=15, width=640):
         cap.release()
 
 
-def _tracks_bits(csv_path: Path, tmp: Path, log):
+def _tracks_bits(csv_path: Path, tmp: Path, log, tag=""):
     """좌표 앞부분과 프레임별 인원 수를 뽑는다."""
     out = []
     try:
@@ -191,7 +197,7 @@ def _tracks_bits(csv_path: Path, tmp: Path, log):
         return out
     try:
         head = pd.read_csv(csv_path, nrows=2000)
-        f = tmp / "tracks_sample.csv"
+        f = tmp / f"{tag}tracks_sample.csv"
         head.to_csv(f, index=False)
         out.append(f)
     except Exception:                # noqa: BLE001
@@ -207,13 +213,13 @@ def _tracks_bits(csv_path: Path, tmp: Path, log):
                                                 values="_n", aggfunc="sum")
                     .fillna(0).astype(int))
             g = g.join(wide)
-        f = tmp / "counts.csv"
+        f = tmp / f"{tag}counts.csv"
         g.to_csv(f)
         out.append(f)
         # 추적 ID 가 얼마나 오래 사는지 — 파편화를 보는 가장 직접적인 숫자
         life = df.groupby("track_id")["frame"].agg(["min", "max", "size"])
         life["frames_alive"] = life["max"] - life["min"] + 1
-        f2 = tmp / "track_life.csv"
+        f2 = tmp / f"{tag}track_life.csv"
         life.sort_values("size", ascending=False).to_csv(f2)
         out.append(f2)
     except Exception:                # noqa: BLE001
@@ -243,6 +249,13 @@ def make_bundle(video, result_dir, out_zip, pitch_l=105.0, pitch_w=68.0,
         if csv_path.is_file():
             log("  좌표 요약을 뽑는 중...")
             for f in _tracks_bits(csv_path, tmp, log):
+                files.append((f, f.name))
+
+        # ID 손질 뒤의 좌표도 같이 넣는다. 손질 전후를 비교해야 '얼마나
+        # 쪼개져 있었나'와 '이어붙이기가 먹혔나'를 한 번에 볼 수 있다.
+        st_path = result_dir / "tracks_stitched.csv"
+        if st_path.is_file():
+            for f in _tracks_bits(st_path, tmp, log, tag="stitched_"):
                 files.append((f, f.name))
 
         if video and Path(video).is_file():

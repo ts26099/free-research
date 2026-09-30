@@ -215,11 +215,33 @@ def has_gpu() -> bool:
         return False
 
 
-def auto_quality() -> tuple[int, int, str]:
-    """GPU 유무를 보고 해상도와 프레임 간격을 정한다. (imgsz, stride, 설명)"""
-    if has_gpu():
-        return 1280, 1, "GPU 가 있어 정확하게 (1280 · 전 프레임)"
-    return 960, 2, "GPU 가 없어 보통 (960 · 2프레임에 1장)"
+# 속도 설정 — (사람 모델 해상도, 프레임 간격, 전체화면 공 패스 간격, 설명)
+# 공 패스 간격 n 은 "공을 쫓는 동안에는 n 장에 한 번만 전체화면을 본다" 는 뜻이다.
+# 공을 놓친 상태면 어느 설정이든 매번 전체화면을 본다.
+SPEED_PRESETS = {
+    "fast":     (832, 3, 10, "빠르게"),
+    "balanced": (960, 2, 6, "보통"),
+    "accurate": (1280, 1, 3, "정확하게"),
+}
+
+
+def auto_quality(speed: str = "auto") -> tuple[int, int, int, str]:
+    """
+    해상도·프레임 간격·공 패스 간격을 정한다. (imgsz, stride, ball_full_every, 설명)
+
+    speed 가 'auto' 면 GPU 유무로 고른다. GPU 가 있으면 전부 켜도 빠르고,
+    없으면 보통으로 간다 — CPU 에서 '정확하게' 는 실측 0.37장/초라 한 시간
+    영상에 하루가 걸린다.
+    """
+    key = speed if speed in SPEED_PRESETS else ("accurate" if has_gpu() else "balanced")
+    imgsz, stride, every, name = SPEED_PRESETS[key]
+    if has_gpu() and key == "accurate":
+        every = 0                     # GPU 면 전체화면을 매번 봐도 된다
+    where = "GPU" if has_gpu() else "CPU"
+    why = f"{where} · {name} ({imgsz}px"
+    why += " · 전 프레임" if stride == 1 else f" · {stride}프레임에 1장"
+    why += f" · 공 전체화면 {'매번' if every <= 0 else f'{every}장에 1번'})"
+    return imgsz, stride, every, why
 
 
 def load_core():
@@ -232,31 +254,62 @@ def load_core():
     return tracker_core
 
 
-def make_config(core, model, ball_model, imgsz, stride, save_video):
+def cpu_threads(log=print) -> None:
+    """CPU 로 돌 때 torch 가 코어를 다 쓰도록 해 둔다."""
+    try:
+        import torch
+    except ImportError:
+        return
+    if has_gpu():
+        return
+    try:
+        n = len(os.sched_getaffinity(0))          # 리눅스
+    except AttributeError:
+        n = os.cpu_count() or 1                   # 윈도우·mac
+    try:
+        if torch.get_num_threads() < n:
+            torch.set_num_threads(n)
+        torch.set_flush_denormal(True)
+    except Exception:                             # noqa: BLE001
+        return
+    log(f"  CPU {n}코어로 돌립니다 (torch 스레드 {torch.get_num_threads()})")
+
+
+def make_config(core, model, ball_model, imgsz, stride, save_video, ball_full_every=6):
     cfg = core.Config()
     cfg.model = str(model)
     cfg.ball_model = str(ball_model or "")
     cfg.imgsz = int(imgsz)
     cfg.vid_stride = int(stride)
+    cfg.ball_full_every = int(ball_full_every)
     cfg.save_video = bool(save_video)
     cfg.skip_done = False
     cfg.watch_folder = False
     # GPU 가 없을 때만, 그리고 openvino 가 실제로 깔려 있을 때만 CPU 가속을 켠다.
     # 없는데 켜 두면 "OpenVINO 가 없어 일반 모드로 돌립니다" 라는 헷갈리는 줄만 남는다.
     cfg.use_openvino = (not has_gpu()) and _have("openvino")
+    if not has_gpu() and not cfg.use_openvino:
+        # 있으면 CPU 추론이 1.5~2배 빨라진다. 없다고 못 도는 건 아니라서
+        # 조용히 넘어가되, 왜 느린지는 알려 준다.
+        import sys as _sys
+        v = f"{_sys.version_info.major}.{_sys.version_info.minor}"
+        tip = ("이 파이썬 버전용 openvino 가 아직 없을 수 있다"
+               if _sys.version_info >= (3, 13) else "setup.bat 을 다시 실행해 보라")
+        print(f"  (CPU 가속 openvino 없음 — 파이썬 {v}, {tip}. 없어도 돌아가지만 느리다)")
     cfg.team_imgsz = max(960, int(imgsz))  # 팀 색은 16장만 크게 본다
     return cfg
 
 
 def track(video: Path, out_root: Path, log, on_progress, should_stop,
           start_sec: float = 0.0, end_sec: float | None = None,
-          save_video: bool = True):
+          save_video: bool = False, speed: str = "auto"):
     """영상 하나를 추적한다. (tracks.csv 경로, summary) 를 돌려준다."""
     model, ball_model, how = ensure_models(log)
     core = load_core()
-    imgsz, stride, why = auto_quality()
+    imgsz, stride, every, why = auto_quality(speed)
     log(f"  {how} · {why}")
-    cfg = make_config(core, model, ball_model, imgsz, stride, save_video)
+    cpu_threads(log)
+    cfg = make_config(core, model, ball_model, imgsz, stride, save_video, every)
     out_root.mkdir(parents=True, exist_ok=True)
     done = core.run_batch([video], out_root, cfg, log=log, on_progress=on_progress,
                           should_stop=should_stop, start_sec=start_sec, end_sec=end_sec)
