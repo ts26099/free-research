@@ -245,6 +245,11 @@ def make_bundle(video, result_dir, out_zip, pitch_l=105.0, pitch_w=68.0,
         if cfg.is_file():
             files.append((cfg, "ipi_config.json"))
 
+        # 보정 확인 그림 — 보정이 맞았는지 가리는 가장 확실한 자료
+        shot = result_dir / "calib_check.png"
+        if shot.is_file():
+            files.append((shot, "calib_check.png"))
+
         csv_path = result_dir / "tracks.csv"
         if csv_path.is_file():
             log("  좌표 요약을 뽑는 중...")

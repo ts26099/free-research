@@ -545,6 +545,7 @@ class App:
                     self.last_video, self.last_result = None, out_dir
                 if self.stop_flag.is_set():
                     break
+                self._calib_png = out_dir / "calib_check.png"
                 H, calib_note = self._calibrate(video, csv_path, cfg)
                 csv_path = self._stitch(csv_path, cfg, H)
                 if self._analyze(csv_path, cfg, out_dir, H, calib_note):
@@ -621,11 +622,20 @@ class App:
             self.q.put(("log", "  좌표를 미터로 바꾸지 못해 기여도 값은 의미가 없습니다. "
                                "[고급 설정] 의 [손으로 보정하기] 를 써 주세요.", "warn"))
             return None, "실패"
-        self.q.put(("log", f"  보정 완료 — {how} (점수 {score:.2f})",
-                    "ok" if score >= 0.8 and how == "흰 선" else "warn"))
+        self.q.put(("log", f"  보정 완료 — {how} (선 모양 검산 {score:.2f})",
+                    "ok" if score >= autocalib.TPL_WEAK and how == "흰 선" else "warn"))
         if note:
             self.q.put(("log", "  " + note, "warn"))
-        return H, f"{how} (점수 {score:.2f})"
+        # 보정이 맞았는지 사람이 눈으로 볼 수 있는 그림을 남긴다.
+        try:
+            shot = autocalib.check_picture(video, H, float(cfg["pitch_l"]),
+                                           float(cfg["pitch_w"]),
+                                           self._calib_png)
+            if shot:
+                self.q.put(("log", f"  보정 확인 그림: {Path(shot).name}", "ok"))
+        except Exception as exc:                              # noqa: BLE001
+            self.q.put(("log", f"  확인 그림을 못 만들었습니다 ({type(exc).__name__})"))
+        return H, f"{how} (선 모양 검산 {score:.2f})"
 
     # ------------------------------------------------ 2.5단계 · ID 손질
     def _stitch(self, csv_path: Path, cfg, H):

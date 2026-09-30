@@ -102,15 +102,13 @@ def _summarize(df, H, pitch_l, pitch_w):
     df = df[ok]
 
     tracks, junk_out, junk_static = {}, [], []
+    out_only = {}          # 밖이라 뺀 것들 — 보정이 의심스러우면 되돌린다
     for tid, g in df.groupby("track_id", sort=False):
         gx, gy = g["_X"].to_numpy(), g["_Y"].to_numpy()
         inside = np.mean((gx > -OUTSIDE_M) & (gx < pitch_l + OUTSIDE_M)
                          & (gy > -OUTSIDE_M) & (gy < pitch_w + OUTSIDE_M))
         life = float(g["_t"].max() - g["_t"].min())
         span = math.hypot(float(gx.max() - gx.min()), float(gy.max() - gy.min()))
-        if inside < INSIDE_MIN:
-            junk_out.append(tid)
-            continue
         if life >= STATIC_SEC and span < STATIC_M:
             junk_static.append(tid)
             continue
@@ -122,8 +120,12 @@ def _summarize(df, H, pitch_l, pitch_w):
                 team = vals.mode().iloc[0]
         t = _Track(tid, g["frame"].to_numpy(), g["_t"].to_numpy(), gx, gy, team)
         t.inside, t.span = float(inside), span
-        tracks[tid] = t
-    return tracks, junk_out, junk_static
+        if inside < INSIDE_MIN:
+            junk_out.append(tid)
+            out_only[tid] = t
+        else:
+            tracks[tid] = t
+    return tracks, junk_out, junk_static, out_only
 
 
 def _pairs(tracks):
@@ -222,7 +224,18 @@ def stitch(csv_path, H, pitch_l=105.0, pitch_w=68.0, log=print,
         return csv_path, report
 
     report["before"] = int(people["track_id"].nunique())
-    tracks, junk_out, junk_static = _summarize(people, H, pitch_l, pitch_w)
+    tracks, junk_out, junk_static, out_only = _summarize(people, H, pitch_l, pitch_w)
+    # 보정이 틀리면 '경기장 밖' 판정이 통째로 엉망이 된다. 실제로 길이
+    # 방향이 어긋난 보정에서 트랙 전부가 밖으로 나와 다 지워졌다.
+    # 절반 넘게 밖이면 그건 사람이 밖에 있는 게 아니라 보정이 틀린 것이다.
+    # 그럴 땐 위치로 거르는 것을 포기하고, 시간·거리로 잇는 일만 한다.
+    total = len(tracks) + len(junk_out) + len(junk_static)
+    if total and len(junk_out) > 0.5 * total:
+        log(f"  ! 트랙의 {len(junk_out)/total*100:.0f}% 가 경기장 밖으로 나옵니다 — "
+            f"사람이 아니라 보정이 틀린 것입니다. 위치로 거르는 건 건너뛰고 "
+            f"끊어진 ID 잇기만 합니다. calib_check.png 를 확인하세요.")
+        tracks.update(out_only)
+        junk_out = []
     report["dropped_outside"] = len(junk_out)
     report["dropped_static"] = len(junk_static)
     if not tracks:

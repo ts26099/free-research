@@ -98,6 +98,225 @@ def inside_quad(quad, pts):
     return float(inside.mean())
 
 
+# ─────────────────────────────── 실제 경기장 선 모양으로 검산
+# 경기장 선의 실제 치수 (FIFA 규격, 원점은 한쪽 골대 왼쪽 모서리).
+# 여기 있는 숫자는 규칙서 그대로다 — 고를 여지가 없는 값이다.
+PEN_DEPTH, PEN_HALF = 16.5, 20.16     # 페널티 구역 (깊이, 반폭)
+GOAL_DEPTH, GOAL_HALF = 5.5, 9.16     # 골 구역
+CIRCLE_R = 9.15                       # 센터서클 · 페널티 아크 반지름
+PEN_SPOT = 11.0                       # 페널티 마크까지
+TPL_STEP = 0.25                       # 본뜨는 격자 간격 (m/칸)
+TPL_TOL = 1.5                         # 이만큼 안에 들면 '선 위'로 본다 (m)
+
+_TPL_CACHE: dict = {}
+
+
+def pitch_lines(pitch_l, pitch_w):
+    """실제 경기장 선 위의 점들을 미터 좌표로 늘어놓는다."""
+    pts = []
+
+    def seg(x0, y0, x1, y1):
+        n = max(2, int(math.hypot(x1 - x0, y1 - y0) / TPL_STEP))
+        t = np.linspace(0, 1, n)
+        pts.append(np.stack([x0 + (x1 - x0) * t, y0 + (y1 - y0) * t], 1))
+
+    def arc(cx, cy, r, a0, a1):
+        n = max(8, int(abs(a1 - a0) * r / TPL_STEP))
+        a = np.linspace(a0, a1, n)
+        pts.append(np.stack([cx + r * np.cos(a), cy + r * np.sin(a)], 1))
+
+    L, W, cy = pitch_l, pitch_w, pitch_w / 2
+    seg(0, 0, L, 0); seg(0, W, L, W)                  # 터치라인
+    seg(0, 0, 0, W); seg(L, 0, L, W)                  # 골라인
+    seg(L / 2, 0, L / 2, W)                           # 하프라인
+    arc(L / 2, cy, CIRCLE_R, 0, 2 * math.pi)          # 센터서클
+    for sx, x0 in ((1, 0.0), (-1, L)):                # 양쪽 페널티·골 구역
+        for d, hh in ((PEN_DEPTH, PEN_HALF), (GOAL_DEPTH, GOAL_HALF)):
+            x1 = x0 + sx * d
+            seg(x1, cy - hh, x1, cy + hh)
+            seg(x0, cy - hh, x1, cy - hh)
+            seg(x0, cy + hh, x1, cy + hh)
+        # 페널티 아크 — 구역 밖으로 나오는 부분만
+        spot = x0 + sx * PEN_SPOT
+        a = math.acos((PEN_DEPTH - PEN_SPOT) / CIRCLE_R)
+        base = 0.0 if sx > 0 else math.pi
+        arc(spot, cy, CIRCLE_R, base - a, base + a)
+    return np.concatenate(pts, 0)
+
+
+def pitch_distance_map(pitch_l, pitch_w):
+    """미터 좌표 -> 가장 가까운 경기장 선까지의 거리(m). (맵, 격자간격, 여백)"""
+    key = (round(pitch_l, 2), round(pitch_w, 2))
+    if key in _TPL_CACHE:
+        return _TPL_CACHE[key]
+    pad = 8.0
+    step = TPL_STEP
+    nx = int((pitch_l + 2 * pad) / step) + 1
+    ny = int((pitch_w + 2 * pad) / step) + 1
+    grid = np.full((ny, nx), 1e9, float)
+    pts = pitch_lines(pitch_l, pitch_w)
+    ix = np.clip(((pts[:, 0] + pad) / step).astype(int), 0, nx - 1)
+    iy = np.clip(((pts[:, 1] + pad) / step).astype(int), 0, ny - 1)
+    grid[iy, ix] = 0.0
+    # 거리 변환. scipy 가 있으면 정확하게, 없으면 두 번 훑는 근사로.
+    try:
+        from scipy.ndimage import distance_transform_edt
+        dist = distance_transform_edt(grid > 0) * step
+    except ImportError:
+        dist = _chamfer(grid > 0) * step
+    out = (dist, step, pad)
+    _TPL_CACHE[key] = out
+    return out
+
+
+def _chamfer(free):
+    """scipy 없을 때 쓰는 거리 근사 (앞뒤로 한 번씩 훑는다)."""
+    big = 1e6
+    d = np.where(free, big, 0.0)
+    ny, nx = d.shape
+    for y in range(ny):
+        for x in range(nx):
+            v = d[y, x]
+            if y: v = min(v, d[y - 1, x] + 1)
+            if x: v = min(v, d[y, x - 1] + 1)
+            if y and x: v = min(v, d[y - 1, x - 1] + 1.414)
+            d[y, x] = v
+    for y in range(ny - 1, -1, -1):
+        for x in range(nx - 1, -1, -1):
+            v = d[y, x]
+            if y < ny - 1: v = min(v, d[y + 1, x] + 1)
+            if x < nx - 1: v = min(v, d[y, x + 1] + 1)
+            if y < ny - 1 and x < nx - 1: v = min(v, d[y + 1, x + 1] + 1.414)
+            d[y, x] = v
+    return d
+
+
+def line_distance_map(lines, cv2):
+    """화면의 각 픽셀에서 가장 가까운 '찾은 흰 선'까지의 거리(px)."""
+    return cv2.distanceTransform((lines == 0).astype(np.uint8), cv2.DIST_L2, 3)
+
+
+def sane_homography(H, shape, pitch_l, pitch_w):
+    """
+    화면 전체가 말이 되는 넓이의 경기장으로 옮겨지는가.
+
+    찌부러진 답을 막는 장치다. 화면을 미터 좌표의 가느다란 띠 하나로
+    몰아넣는 변환은 '경기장 선을 얼마나 덮었나' 를 1.0 가까이 받는다 —
+    그 띠 안에 선 픽셀이 잔뜩 있기 때문이다. 실제로 다듬기 단계가 그런
+    답으로 흘러가 점수 0.99 를 받고 센터서클을 X=15m 에 갖다 놓았다.
+    화면 네 귀퉁이가 옮겨간 사각형의 가로·세로·넓이를 보면 바로 걸린다.
+    """
+    if H is None:
+        return False
+    H = np.asarray(H, float)
+    h, w = shape[:2]
+    c = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+    # 지평선이 화면을 가로지르면 안 된다. H 의 3행이 0 이 되는 선이
+    # 지평선이고, 그 너머는 '카메라 뒤' 라 좌표가 뒤집히며 수백 m 로
+    # 튄다. 네 귀퉁이의 부호가 같아야 화면 전체가 지평선 한쪽에 있다.
+    wq = H[2, 0] * c[:, 0] + H[2, 1] * c[:, 1] + H[2, 2]
+    if np.ptp(np.sign(wq)) > 0 or np.min(np.abs(wq)) < 1e-9:
+        return False
+    X, Y = apply_h(H, c[:, 0], c[:, 1])
+    if not (np.isfinite(X).all() and np.isfinite(Y).all()):
+        return False
+    if np.ptp(X) < 20.0 or np.ptp(Y) < 20.0:
+        return False
+    area = 0.5 * abs(np.dot(X, np.roll(Y, -1)) - np.dot(Y, np.roll(X, -1)))
+    ref = pitch_l * pitch_w
+    return 0.15 * ref < area < 6.0 * ref
+
+
+def template_score(H, dist_px, shape, pitch_l, pitch_w, tol=3.0):
+    """
+    실제 경기장 선을 화면에 되돌려 그렸을 때, 찾은 흰 선 위에 얼마나 얹히나.
+
+    방향이 중요하다. 반대로 ('찾은 흰 선이 경기장 선 근처인가') 재면 안 된다.
+    화면에서 찾은 '선' 의 대부분은 잔디 깎은 줄무늬·광고판·관중석 가장자리라
+    진짜 경기장 선이 아니고, 화면을 좁게 뭉개는 엉터리 보정일수록 그 잡동사니가
+    우연히 무슨 선 근처엔가 떨어진다. 실제로 그렇게 재 보니 정답 보정(0.30)이
+    90도 돌아간 엉터리 보정(0.34)보다 낮게 나왔다.
+
+    이쪽 방향은 속지 않는다. 센터서클·페널티박스·하프라인은 실제로 거기
+    있어야만 덮이기 때문이다. 보정이 틀리면 원이 엉뚱한 자리에 그려진다.
+    """
+    if H is None or dist_px is None:
+        return 0.0
+    if not sane_homography(H, shape, pitch_l, pitch_w):
+        return 0.0
+    h, w = shape[:2]
+    tpl = pitch_lines(pitch_l, pitch_w)
+    try:
+        Hi = np.linalg.inv(np.asarray(H, float))
+    except np.linalg.LinAlgError:
+        return 0.0
+    q = Hi @ np.stack([tpl[:, 0], tpl[:, 1], np.ones(len(tpl))])
+    ok = np.abs(q[2]) > 1e-9
+    if ok.sum() < 50:
+        return 0.0
+    x, y = q[0][ok] / q[2][ok], q[1][ok] / q[2][ok]
+    vis = (x >= 0) & (x < w) & (y >= 0) & (y < h)
+    # 화면에 보이는 경기장 선이 너무 적으면 판단할 수 없다 (덮은 비율이
+    # 우연히 높게 나오기 쉽다)
+    if vis.sum() < 200:
+        return 0.0
+    # 찌부러진 답 막기. 경기장을 화면의 좁은 띠 하나에 몰아넣는 변환은
+    # 그 띠에 선 픽셀이 많으면 덮은 비율이 1.0 에 가깝게 나온다. 실제로
+    # 다듬기 단계가 그런 답으로 흘러가 점수 0.99 를 받은 적이 있다.
+    # 경기장이 화면에서 차지하는 폭과 높이가 충분해야 점수를 준다.
+    xv, yv = x[vis], y[vis]
+    if (np.ptp(xv) < 0.25 * w) or (np.ptp(yv) < 0.25 * h):
+        return 0.0
+    d = dist_px[y[vis].astype(int), x[vis].astype(int)]
+    return float(np.mean(d <= tol))
+
+
+def refine_to_lines(H, line_pts, dist_px, shape, pitch_l, pitch_w, rounds=10):
+    """
+    거친 보정을 실제 경기장 선 위로 당겨 붙인다 (ICP).
+
+    네 개의 바깥 선만으로 잡은 보정은 방향은 맞아도 몇 미터씩 어긋난다.
+    선 하나를 잘못 집으면 센터서클이 10m 씩 밀린다. 그래서 찾은 흰 선을
+    미터로 옮긴 다음, 각 점을 '가장 가까운 실제 경기장 선 위의 점'에
+    짝지어 다시 풀기를 반복한다. 짝을 찾는 반경을 회를 거듭하며 좁혀
+    가까운 짝만 남기므로, 잘못 집힌 선은 저절로 빠진다.
+
+    더 나아지지 않으면 원래 것을 그대로 돌려준다.
+    """
+    if H is None or line_pts is None or len(line_pts) < 30:
+        return H, 0.0
+    try:
+        from scipy.spatial import cKDTree
+    except ImportError:
+        return H, template_score(H, dist_px, shape, pitch_l, pitch_w)
+    tpl = pitch_lines(pitch_l, pitch_w)
+    tree = cKDTree(tpl)
+    best_H = np.asarray(H, float)
+    best_s = template_score(best_H, dist_px, shape, pitch_l, pitch_w)
+    cur = best_H
+    for r in range(rounds):
+        X, Y = apply_h(cur, line_pts[:, 0], line_pts[:, 1])
+        ok = np.isfinite(X) & np.isfinite(Y)
+        if ok.sum() < 20:
+            break
+        d, idx = tree.query(np.stack([X[ok], Y[ok]], 1))
+        # 짝 지을 반경을 6m 에서 1m 까지 좁혀 간다
+        rad = 6.0 * (1.0 - r / max(1, rounds - 1)) + 1.0
+        take = d < rad
+        if take.sum() < 12:
+            break
+        src = line_pts[ok][take]
+        dst = tpl[idx[take]]
+        nxt = homography(src, dst)
+        if nxt is None:
+            break
+        sc = template_score(nxt, dist_px, shape, pitch_l, pitch_w)
+        if sc > best_s + 1e-4:
+            best_H, best_s = nxt, sc
+        cur = nxt
+    return best_H, best_s
+
+
 def score_homography(H, px, py, pitch_l, pitch_w):
     """
     변환이 말이 되는지 0~1 로 점수를 매긴다.
@@ -250,34 +469,42 @@ def find_by_lines(img, pitch_l, pitch_w, cv2, px=None, py=None):
     들어오는 것을 고른다. 페널티박스 선이나 하프라인이 섞여 있어도
     검산이 걸러 주므로 결과가 흔들리지 않는다.
 
-    (H, 점수) 를 돌려준다.
+    (H, 점수, 선모양 점수) 를 돌려준다.
     """
     mask = grass_mask(img, cv2)
     if mask is None:
-        return None, 0.0
+        return None, 0.0, 0.0
     lines = line_pixels(img, mask, cv2)
     h, w = img.shape[:2]
     segs = cv2.HoughLinesP(lines, 1, np.pi / 360, threshold=60,
                            minLineLength=int(min(w, h) * 0.16), maxLineGap=25)
     if segs is None or len(segs) < 4:
-        return None, 0.0
-    # 선 픽셀을 솎아 둔다. 후보 사각형이 경기장 선을 다 품는지 보는 데 쓴다.
+        return None, 0.0, 0.0
+    # 선 픽셀을 솎아 둔다 (사각형이 선을 품는지 보는 데 쓴다) 와,
+    # 화면 어디서든 가장 가까운 선까지의 거리 지도 (검산에 쓴다).
     ys, xs = np.nonzero(lines)
     if len(xs) > 3000:
         pick = np.linspace(0, len(xs) - 1, 3000).astype(int)
         xs, ys = xs[pick], ys[pick]
     line_pts = np.stack([xs, ys], axis=1).astype(float)
+    dist_px = line_distance_map(lines, cv2)
 
     horiz, vert = _families(segs.reshape(-1, 4), w, h)
     if len(horiz) < 2 or len(vert) < 2:
-        return None, 0.0
+        return None, 0.0, 0.0
     # 바깥쪽 후보만 남긴다 (위치 기준 양 끝에서 각각 네 개까지)
     horiz = sorted(horiz, key=lambda t: t[1])
     vert = sorted(vert, key=lambda t: t[1])
     horiz = horiz[:4] + horiz[-4:]
     vert = vert[:4] + vert[-4:]
 
-    dst = np.float32([[0, 0], [pitch_l, 0], [pitch_l, pitch_w], [0, pitch_w]])
+    # 사각형의 네 모서리를 경기장 어디에 붙일 것인가.
+    # 예전에는 '화면 가로 = 경기장 길이' 하나만 봤다. 옆에서 찍은 중계
+    # 화면은 그게 맞지만, 골대 뒤에서 찍으면 경기장 길이가 화면 세로로
+    # 선다. 그때 90도 돌아간 보정이 나오면서 모든 거리가 틀어졌다.
+    # 두 가지를 다 만들어 보고 선 모양이 맞는 쪽을 고른다.
+    dsts = [np.float32([[0, 0], [pitch_l, 0], [pitch_l, pitch_w], [0, pitch_w]]),
+            np.float32([[0, 0], [0, pitch_w], [pitch_l, pitch_w], [pitch_l, 0]])]
     min_gap_h, min_gap_v = h * 0.12, w * 0.12
     best_H, best_s = None, 0.0
     for i in range(len(horiz)):
@@ -294,16 +521,21 @@ def find_by_lines(img, pitch_l, pitch_w, cv2, px=None, py=None):
                         continue
                     if cv2.contourArea(quad.astype(np.float32)) < 0.06 * w * h:
                         continue
-                    H = homography(quad, dst)
-                    if H is None:
-                        continue
-                    s, _ = score_homography(H, px, py, pitch_l, pitch_w)
-                    # 경기장 선을 얼마나 품는가. 이것이 페널티박스 선을 경계로
-                    # 잘못 고르는 것을 막는 결정적인 단서다.
-                    s = 0.75 * s + 0.25 * inside_quad(quad, line_pts)
-                    if s > best_s + 1e-6:
-                        best_H, best_s = H, s
-    return best_H, best_s
+                    for dst in dsts:
+                        H = homography(quad, dst)
+                        if H is None:
+                            continue
+                        base, _ = score_homography(H, px, py, pitch_l, pitch_w)
+                        # 찾은 흰 선이 실제 경기장 선 모양과 맞는가.
+                        # 이것만이 '하프라인+페널티박스 선을 경기장 테두리로
+                        # 착각해 화면을 통째로 늘려 붙인' 경우를 걸러낸다.
+                        tpl = template_score(H, dist_px, img.shape, pitch_l, pitch_w)
+                        s = 0.6 * tpl + 0.3 * base + 0.1 * inside_quad(quad, line_pts)
+                        if s > best_s + 1e-6:
+                            best_H, best_s, best_tpl = H, s, tpl
+    if best_H is None:
+        return None, 0.0, 0.0
+    return best_H, best_s, best_tpl
 
 
 # ────────────────────────────────────────────── 2) 선수가 퍼진 범위로 찾기
@@ -358,59 +590,149 @@ def sample_frames(video, n=9, log=print):
     return out, cv2
 
 
+# 선 모양 검산 점수의 눈금.
+# 이 점수는 '실제 경기장 선을 화면에 되돌려 그렸을 때 찾은 흰 선 위에
+# 얼마나 얹히나' 다. 높다고 보정이 맞았다는 보장은 못 한다 — 경기장의
+# 절반만 보이는 화면에서는 보이는 쪽만 맞춰 놓고도 높게 나온다 (실측:
+# 길이 방향이 1.9배 늘어난 보정이 0.75 를 받았다). 낮으면 확실히 틀렸다는
+# 것만 믿을 수 있다. 그래서 어느 쪽이든 calib_check.png 를 보게 한다.
+TPL_WEAK = 0.45        # 이 아래면 확실히 틀렸다
+MOVE_WARN = 8.0        # 장면마다 보정이 이만큼(m) 넘게 다르면 카메라가 움직인다
+
+
+def check_picture(video, H, pitch_l, pitch_w, out_path, log=print):
+    """
+    실제 경기장 선을 화면에 되돌려 그린 그림을 저장한다.
+
+    보정이 틀렸는지 한눈에 알 수 있는 가장 확실한 방법이다. 점수 0.96 이라고
+    적어 놔도 사람은 그 숫자가 무슨 뜻인지 모른다. 그런데 그린 선이 화면의
+    흰 선 위에 얹혀 있는지는 누구나 1초 만에 본다.
+    """
+    try:
+        import cv2
+    except ImportError:
+        return None
+    frames, cv2m = sample_frames(video, 3, lambda *_: None)
+    if not frames:
+        return None
+    img = frames[len(frames) // 2]
+    out = img.copy()
+    tpl = pitch_lines(pitch_l, pitch_w)
+    try:
+        Hi = np.linalg.inv(np.asarray(H, float))
+    except np.linalg.LinAlgError:
+        return None
+    q = Hi @ np.stack([tpl[:, 0], tpl[:, 1], np.ones(len(tpl))])
+    ok = np.abs(q[2]) > 1e-9
+    x, y = q[0][ok] / q[2][ok], q[1][ok] / q[2][ok]
+    h, w = out.shape[:2]
+    for xx, yy in zip(x, y):
+        if -20 < xx < w + 20 and -20 < yy < h + 20:
+            cv2.circle(out, (int(xx), int(yy)), 1, (0, 0, 255), -1)
+    cv2.putText(out, "red = where the program thinks the lines are",
+                (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    cv2.putText(out, "if red does not sit on the white lines, calibration is wrong",
+                (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+    try:
+        cv2.imwrite(str(out_path), out)
+        return out_path
+    except Exception:              # noqa: BLE001
+        return None
+
+
 def calibrate(video, tracks_px, pitch_l, pitch_w, log=print):
     """
     자동 보정. (H, 방법, 점수, 설명) 을 돌려준다. 못 하면 (None, ...).
 
     tracks_px : (발밑 x 픽셀 배열, 발밑 y 픽셀 배열) — 추적 결과.
                 검산과 두 번째 방법에 쓴다.
+
+    점수는 '선 모양 검산' 이다. 실제 경기장 선을 화면에 되돌려 그렸을 때
+    찾은 흰 선 위에 얼마나 얹히는가. 선수가 경기장 안에 들어오는지만 보는
+    예전 점수는 90도 돌아간 보정에도 0.96 을 줬다 — 어떻게 돌려 붙여도
+    사람은 다 안에 들어오기 때문이다.
     """
     px, py = tracks_px
     frames, cv2 = sample_frames(video, 9, log)
     if cv2 is None:
         return None, "없음", 0.0, "opencv 가 없어 자동 보정을 못 했습니다."
-    best = (None, 0.0, "")
+    best = (None, 0.0, "", 0.0)
     if frames:
-        # 검산에 쓸 발밑 점은 골고루 솎아 쓴다 (전부 쓰면 느리다)
         n = len(px)
         step = max(1, n // 1500)
         sx, sy = np.asarray(px, float)[::step], np.asarray(py, float)[::step]
         cands = []
-        for i, img in enumerate(frames):
+        for img in frames:
             try:
-                H, sc = find_by_lines(img, pitch_l, pitch_w, cv2, sx, sy)
+                H, sc, tpl = find_by_lines(img, pitch_l, pitch_w, cv2, sx, sy)
             except Exception:           # noqa: BLE001 — 한 장 실패가 전체를 막으면 안 된다
-                H, sc = None, 0.0
+                H, sc, tpl = None, 0.0, 0.0
             if H is None:
                 continue
-            cands.append((sc, H, score_homography(H, px, py, pitch_l, pitch_w)[1]))
+            cands.append((tpl, sc, H, img))
         if cands:
             cands.sort(key=lambda c: -c[0])
-            s, H, info = cands[0]
+            tpl, sc, H, img = cands[0]
+            # 여기서 ICP 로 선 위에 더 당겨 붙여 보려고 했지만 뺐다.
+            # '경기장 선을 얼마나 덮었나' 를 크게 하는 쪽으로만 움직이니
+            # 경기장을 화면 한쪽으로 찌부러뜨리는 답으로 흘러갔다 (점수
+            # 0.99 를 받고 센터서클을 X=13m 에 갖다 놓았다). 넓이 검사로
+            # 막아도 0.80 짜리 엉터리가 남았다. 확인할 수 없는 개선은
+            # 넣지 않는다 — 대신 아래 calib_check.png 로 사람이 본다.
             log(f"    흰 선으로 찾기: {len(cands)}/{len(frames)}장 성공 · "
-                f"최고 점수 {s:.2f} (경기장 안 {info.get('inside', 0)*100:.0f}% · "
-                f"가로 {info.get('span_x', 0)*100:.0f}% 세로 {info.get('span_y', 0)*100:.0f}%)")
-            best = (H, s, "흰 선")
-    if best[1] < 0.75:
+                f"선 모양 검산 {tpl:.2f}")
+            # 카메라가 움직이는가 — 장마다 나온 보정이 서로 크게 다르면
+            # 한 장의 보정을 영상 전체에 쓸 수 없다.
+            spread = _disagreement([c[2] for c in cands[:5]], img.shape, pitch_l, pitch_w)
+            best = (H, tpl, "흰 선", spread)
+    if best[1] < TPL_WEAK:
         try:
             H2 = find_by_players(px, py, pitch_l, pitch_w, cv2)
         except Exception:               # noqa: BLE001
             H2 = None
-        if H2 is not None:
+        if H2 is not None and best[0] is None:
             s2, info2 = score_homography(H2, px, py, pitch_l, pitch_w)
-            log(f"    선수가 퍼진 범위로 찾기: 점수 {s2:.2f} "
-                f"(경기장 안 {info2.get('inside', 0)*100:.0f}%)")
-            if s2 > best[1]:
-                best = (H2, s2, "선수 범위(대략)")
-    H, score, how = best
-    if H is None or score < 0.45:
-        return None, how or "없음", score, (
+            log(f"    선을 못 찾아 선수가 퍼진 범위로 어림잡습니다 (점수 {s2:.2f})")
+            best = (H2, 0.0, "선수 범위(대략)", 0.0)
+    H, tpl, how, spread = best
+    if H is None:
+        return None, how or "없음", 0.0, (
             "자동 보정에 실패했습니다. 경기장 전체가 보이는 고정 카메라 영상이면 "
-            "잘 되고, 중계 화면처럼 카메라가 계속 움직이면 어렵습니다.")
-    note = ""
+            "잘 되고, 중계 화면처럼 카메라가 계속 움직이면 어렵습니다. "
+            "[고급 설정] 의 [손으로 보정하기] 를 써 주세요.")
+    notes = []
     if how.startswith("선수"):
-        note = ("선을 못 찾아 선수들이 퍼진 범위로 어림잡았습니다. "
-                "거리가 실제와 다를 수 있으니 결과는 대략으로 보세요.")
-    elif score < 0.8:
-        note = "보정이 완벽하지는 않습니다. 결과를 참고용으로 보세요."
-    return H, how, score, note
+        notes.append("선을 못 찾아 선수들이 퍼진 범위로 어림잡았습니다. "
+                     "거리가 실제와 많이 다를 수 있습니다.")
+    elif tpl < TPL_WEAK:
+        notes.append(f"! 선 모양 검산 {tpl:.2f} — 그려 본 경기장 선이 화면의 흰 선과 "
+                     f"전혀 맞지 않습니다. 미터로 바꾼 값을 믿으면 안 됩니다.")
+    if spread > MOVE_WARN:
+        notes.append(f"! 장면마다 보정이 평균 {spread:.0f} m 씩 다릅니다 — 카메라가 "
+                     f"움직이는 중계 화면입니다. 보정 한 번을 영상 전체에 쓰므로 "
+                     f"거리 값이 구간마다 틀어집니다. [고급 설정] 의 '구간' 으로 "
+                     f"카메라가 거의 안 움직이는 몇 분만 잘라 보세요.")
+    # 점수가 높아도 맞았다는 보장이 안 되므로, 언제나 그림을 보게 한다.
+    notes.append("결과 폴더의 calib_check.png 를 꼭 한 번 보세요. 빨간 선이 화면의 "
+                 "흰 선 위에 얹혀 있어야 합니다. 어긋나 있으면 [고급 설정] 의 "
+                 "[손으로 보정하기] 로 네 점을 직접 찍어 주세요 — 그게 가장 정확합니다.")
+    return H, how, tpl, "  ".join(notes)
+
+
+def _disagreement(Hs, shape, pitch_l, pitch_w):
+    """여러 장에서 나온 보정이 서로 얼마나 다른가 (화면 네 귀퉁이의 평균 어긋남, m)."""
+    if len(Hs) < 2:
+        return 0.0
+    h, w = shape[:2]
+    pts = np.float32([[w * .25, h * .25], [w * .75, h * .25],
+                      [w * .25, h * .75], [w * .75, h * .75]])
+    mapped = []
+    for H in Hs:
+        X, Y = apply_h(H, pts[:, 0], pts[:, 1])
+        if not (np.isfinite(X).all() and np.isfinite(Y).all()):
+            continue
+        mapped.append(np.stack([X, Y], 1))
+    if len(mapped) < 2:
+        return 0.0
+    a = np.stack(mapped)
+    return float(np.mean(np.linalg.norm(a - a.mean(0), axis=2)))
