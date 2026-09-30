@@ -35,6 +35,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import autocalib
 import autotrack
+import diagnose
 import pipeline
 
 ROOT = Path(__file__).resolve().parent
@@ -172,6 +173,8 @@ class App:
         self.worker: threading.Thread | None = None
         self.stop_flag = threading.Event()
         self.adv_open = False
+        self.last_video = None      # 진단 자료를 만들 때 쓴다
+        self.last_result = None
         for d in (Path(self.cfg["results_dir"]), LOGS_DIR):
             try:
                 Path(d).mkdir(parents=True, exist_ok=True)
@@ -255,6 +258,8 @@ class App:
         ttk.Button(run, text="결과 폴더 열기",
                    command=lambda: self.open_folder(Path(self.cfg["results_dir"]))
                    ).pack(side="right")
+        ttk.Button(run, text="진단 자료 만들기", command=self.make_diag
+                   ).pack(side="right", padx=8)
         self.adv_btn = ttk.Button(run, text="고급 설정  ▼", command=self.toggle_adv)
         self.adv_btn.pack(side="right", padx=8)
 
@@ -494,13 +499,17 @@ class App:
                 self.q.put(("log", f"\n[{item.name}]", "head"))
                 if pipeline.is_video(item):
                     csv_path = self._track(item, cfg, out_root)
+                    self.last_video = item
                     if csv_path is None:
+                        self.last_result = None
                         continue
                     out_dir = csv_path.parent
                     video = item
+                    self.last_result = out_dir
                 else:
                     csv_path, out_dir, video = item, out_root / item.stem, None
                     out_dir.mkdir(parents=True, exist_ok=True)
+                    self.last_video, self.last_result = None, out_dir
                 if self.stop_flag.is_set():
                     break
                 H, calib_note = self._calibrate(video, csv_path, cfg)
@@ -638,6 +647,65 @@ class App:
         eng.PROGRESS_CB = lambda stage, cur, total: self.q.put(("stage", stage, cur, total))
         eng.STOP_CB = self.stop_flag.is_set
 
+    # ------------------------------------------------------- 진단 자료
+    def make_diag(self):
+        """
+        무엇이 잘못됐는지 남에게 보여줄 작은 압축파일을 만든다.
+
+        경기 영상은 수백 MB 라 주고받기 어렵다. 그런데 문제를 찾는 데 필요한 것은
+        영상 전체가 아니라 화면 몇 장과 기록이다. 그것만 모아 2~5 MB 로 묶는다.
+        """
+        if self._busy():
+            messagebox.showinfo("분석 중", "분석이 끝난 뒤에 만들 수 있습니다.")
+            return
+        result = self.last_result
+        if result is None or not Path(result).is_dir():
+            root = Path(self.cfg["results_dir"])
+            dirs = [d for d in root.iterdir() if d.is_dir()] if root.is_dir() else []
+            if not dirs:
+                messagebox.showinfo(
+                    "먼저 한 번 돌려 주세요",
+                    "진단 자료는 분석을 한 번 돌린 뒤에 만들 수 있습니다.\n"
+                    "짧은 구간이라도 한 번 [분석 시작] 을 눌러 주세요.")
+                return
+            result = max(dirs, key=lambda d: d.stat().st_mtime)
+        video = self.last_video
+        if video is None or not Path(video).is_file():
+            video = next((p for p in self.pending if pipeline.is_video(p)), None)
+
+        ask = messagebox.askyesnocancel(
+            "진단 자료 만들기",
+            f"결과 폴더: {Path(result).name}\n\n"
+            "무엇이 잘못됐는지 알아보는 데 필요한 것만 모아 압축합니다.\n"
+            "  · 화면에 나왔던 기록(log.txt)과 추적 통계\n"
+            "  · 영상에서 뽑은 화면 6장 (작게 줄인 사진)\n"
+            "  · 경기장 보정이 무엇을 보고 있는지 그린 그림 3장\n"
+            "  · 좌표 앞부분과 프레임별 인원 수\n\n"
+            "[예]   영상 15초도 작게 잘라 함께 넣습니다 (가장 도움이 됩니다)\n"
+            "[아니오]  영상은 넣지 않습니다\n"
+            "[취소]  그만둡니다")
+        if ask is None:
+            return
+
+        out = Path(result) / f"진단자료_{Path(result).name}.zip"
+        self.log("진단 자료를 만드는 중입니다...", "head")
+        self.start_btn.configure(state="disabled")
+
+        def work():
+            try:
+                diagnose.make_bundle(
+                    video, result, out,
+                    pitch_l=float(self.cfg["pitch_l"]), pitch_w=float(self.cfg["pitch_w"]),
+                    include_clip=bool(ask),
+                    log=lambda m: self.q.put(("log", str(m))))
+                self.q.put(("diag", str(out)))
+            except Exception as exc:                      # noqa: BLE001
+                self.q.put(("log", f"  진단 자료 만들기 실패: "
+                                   f"{type(exc).__name__}: {exc}", "warn"))
+                self.q.put(("diag", ""))
+
+        threading.Thread(target=work, daemon=True).start()
+
     # --------------------------------------------------------- 메시지 펌프
     def _drain(self):
         try:
@@ -654,6 +722,13 @@ class App:
                         self.status.configure(text=f"{stage}   {cur:,} / {total:,}  ({pct:.0f}%)")
                     else:
                         self.status.configure(text=f"{stage} ...")
+                elif kind == "diag":
+                    self.start_btn.configure(state="normal")
+                    if msg[1]:
+                        mb = Path(msg[1]).stat().st_size / 1e6
+                        self.log(f"진단 자료를 만들었습니다 ({mb:.1f} MB)", "ok")
+                        self.log(f"   {msg[1]}", "ok")
+                        self.open_folder(Path(msg[1]).parent)
                 elif kind == "done":
                     self._finished(msg[1], msg[2])
         except queue.Empty:
