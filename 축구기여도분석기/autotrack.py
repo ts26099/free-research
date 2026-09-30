@@ -42,7 +42,22 @@ TIMEOUT = 60
 
 
 def _is_ball_name(name: str) -> bool:
-    return "ball" in Path(name).name.lower()
+    """
+    파일 이름으로 '공 전용 모델'인지 가린다.
+
+    그냥 'ball' 이 들어 있는지 보면 안 된다. football 안에 ball 이 들어 있어서
+    'yolo-football-player-detection.pt' 같은 선수 모델까지 공으로 찍힌다.
+    실제로 그 때문에 모델을 잘 받아 놓고도 '못 구했다'며 COCO 로 떨어졌다.
+    football / foot-ball 을 먼저 지우고 나서 본다.
+    """
+    s = Path(name).name.lower()
+    if s.startswith("soccer_ball_"):
+        return True
+    if s.startswith("soccer_player_"):
+        return False
+    for w in ("football", "foot-ball", "foot_ball"):
+        s = s.replace(w, "")
+    return "ball" in s
 
 
 def local_models() -> tuple[Path | None, Path | None]:
@@ -82,7 +97,7 @@ def _copy_from_neighbour(log) -> bool:
     return got > 0
 
 
-def _hf_pick(repo: str, want_ball: bool, log) -> str | None:
+def _hf_pick(repo: str, log) -> str | None:
     """그 저장소에 들어 있는 .pt 파일 이름 하나를 고른다."""
     try:
         req = urllib.request.Request(HF_API.format(repo=repo), headers=UA)
@@ -131,22 +146,28 @@ def _download(url: str, dst: Path, log, label: str) -> bool:
         return False
 
 
-def _download_models(log) -> bool:
-    """HuggingFace 에서 축구 전용 모델을 받는다."""
+def _download_models(log) -> dict:
+    """
+    HuggingFace 에서 축구 전용 모델을 받는다.
+
+    받은 파일 경로를 {"player": Path, "ball": Path} 로 돌려준다.
+    폴더를 다시 훑지 않고 이 값을 그대로 쓴다 — 이름으로 다시 가리다가
+    football/ball 때문에 틀리는 일이 없도록.
+    """
     MODELS.mkdir(parents=True, exist_ok=True)
-    got = 0
+    got: dict[str, Path] = {}
     for kind, repo in HF_REPOS.items():
-        name = _hf_pick(repo, kind == "ball", log)
+        name = _hf_pick(repo, log)
         if not name:
             continue
-        out = MODELS / (f"soccer_{kind}_" + Path(name).name)
-        if out.exists():
-            got += 1
+        out = MODELS / f"soccer_{kind}_{Path(name).name}"
+        if out.exists() and out.stat().st_size > 100_000:
+            got[kind] = out
             continue
         log(f"    {kind} 모델을 내려받습니다 ({repo})")
         if _download(HF_FILE.format(repo=repo, name=name), out, log, kind):
-            got += 1
-    return got > 0
+            got[kind] = out
+    return got
 
 
 def ensure_models(log=print) -> tuple[str | None, str | None, str]:
@@ -164,15 +185,26 @@ def ensure_models(log=print) -> tuple[str | None, str | None, str]:
         if player:
             return str(player), (str(ball) if ball else None), "옆 폴더에서 복사한 축구 전용 모델"
 
-    if _download_models(log):
-        player, ball = local_models()
-        if player:
-            return str(player), (str(ball) if ball else None), "내려받은 축구 전용 모델"
+    got = _download_models(log)
+    if got.get("player"):
+        return (str(got["player"]),
+                str(got["ball"]) if got.get("ball") else None,
+                "내려받은 축구 전용 모델")
+    if got:
+        log(f"    ! 공 모델만 받았습니다. 선수 모델을 못 받아 축구 모델을 쓸 수 없습니다.")
 
     log("  ! 축구 전용 모델을 구하지 못했습니다 (인터넷이 막혀 있을 수 있습니다).")
     log("    일반 COCO 모델로 진행합니다 — 선수를 절반 정도밖에 못 찾고,")
     log("    심판·골키퍼를 구분하지 못하며, 공은 거의 못 잡습니다.")
     return COCO_FALLBACK, None, "일반 COCO 모델 (축구 전용 모델 없음)"
+
+
+def _have(mod: str) -> bool:
+    import importlib.util
+    try:
+        return importlib.util.find_spec(mod) is not None
+    except (ImportError, ValueError):
+        return False
 
 
 def has_gpu() -> bool:
@@ -209,7 +241,9 @@ def make_config(core, model, ball_model, imgsz, stride, save_video):
     cfg.save_video = bool(save_video)
     cfg.skip_done = False
     cfg.watch_folder = False
-    cfg.use_openvino = not has_gpu()      # GPU 가 없으면 CPU 가속을 켠다
+    # GPU 가 없을 때만, 그리고 openvino 가 실제로 깔려 있을 때만 CPU 가속을 켠다.
+    # 없는데 켜 두면 "OpenVINO 가 없어 일반 모드로 돌립니다" 라는 헷갈리는 줄만 남는다.
+    cfg.use_openvino = (not has_gpu()) and _have("openvino")
     cfg.team_imgsz = max(960, int(imgsz))  # 팀 색은 16장만 크게 본다
     return cfg
 
@@ -234,3 +268,22 @@ def track(video: Path, out_root: Path, log, on_progress, should_stop,
         out_dir = out_dir.with_name(f"{out_dir.name} {tag}")
     csv_path = out_dir / "tracks.csv"
     return (csv_path if csv_path.exists() else None), done[0]
+
+
+def self_check() -> list[str]:
+    """이름 판정이 헷갈리지 않는지 확인한다. 틀린 항목을 돌려준다."""
+    cases = [
+        ("soccer_player_yolo-football-player-detection.pt", False),
+        ("soccer_ball_yolo-football-ball-detection.pt", True),
+        ("football_player_best.pt", False),
+        ("soccer_yolo11m.pt", False),
+        ("soccer_ball_yolo11n.pt", True),
+        ("best_ball.pt", True),
+    ]
+    return [f"{n} -> {_is_ball_name(n)} (기대 {want})"
+            for n, want in cases if _is_ball_name(n) != want]
+
+
+if __name__ == "__main__":
+    bad = self_check()
+    print("모델 이름 판정:", "이상 없음" if not bad else "틀림 " + " / ".join(bad))
