@@ -1,13 +1,20 @@
 """
-축구 기여도 분석기 — 영상을 넣으면 선수별 기여도까지 한 번에.
+축구 기여도 분석기 — 영상을 넣고 [분석 시작] 만 누르면 끝.
 
 START.bat (윈도우) 또는 start.sh (리눅스/맥) 로 실행한다.
-영상을 창에 끌어다 놓고 [분석 시작] 을 누르면 두 단계가 이어서 돈다.
+사람이 할 일은 둘뿐이다.
+    1. 경기 영상을 창에 끌어다 놓는다
+    2. [▶ 분석 시작] 을 누른다
 
-    1단계  영상 -> 좌표    SoccerTracker 의 tracker.py (YOLO + ByteTrack)
-    2단계  좌표 -> 기여도  soccer_ipi_v8.py (SC · PR · PA · DPI · IPI)
+나머지는 프로그램이 알아서 한다.
+    · 검출 모델이 없으면 받아 온다 (처음 한 번만)
+    · GPU 유무를 보고 추적 품질을 정한다
+    · 영상에서 선수와 공 위치를 뽑는다                      -> tracks.csv
+    · 경기장 흰 선을 찾아 화면 픽셀을 미터로 바꾼다          -> 자동 보정
+    · 한 팀 인원을 데이터에서 헤아린다
+    · 기여도를 계산한다 (SC · PR · PA · DPI · IPI)         -> ipi_result.xlsx
 
-이미 뽑아 둔 tracks.csv 를 넣으면 1단계를 건너뛰고 바로 2단계만 돈다.
+값을 직접 만지고 싶으면 [고급 설정] 을 펼치면 된다. 안 건드려도 된다.
 """
 
 from __future__ import annotations
@@ -23,14 +30,16 @@ import time
 import traceback
 import types
 import tkinter as tk
-
-import pipeline
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+import autocalib
+import autotrack
+import pipeline
+
 ROOT = Path(__file__).resolve().parent
 ENGINE = ROOT / "soccer_ipi_v8.py"
-RESULTS_DIR = ROOT / "results_ipi"
+RESULTS_DIR = ROOT / "results"
 CONFIG_PATH = ROOT / "ipi_config.json"
 LOGS_DIR = ROOT / "logs"
 
@@ -42,24 +51,17 @@ ACCENT = "#4c8dff"
 OKC = "#5fd08a"
 WARN = "#ffb35c"
 
-DATA_EXT = ("*.csv *.xlsx *.xls *.txt *.tsv")
-
 DEFAULTS = {
-    "pitch_l": 105.0, "pitch_w": 68.0, "team_size": 11,
-    "fps": "", "norm": "z",
-    "team_a": "", "team_b": "",
-    "homography_src": None, "homography_dst": None,
-    "exclude_gk": True, "pos_adjust": True, "pa_learn": True,
-    "save_plot": True, "drop_referee": True,
+    "pitch_l": 105.0, "pitch_w": 68.0, "team_size": 0,     # 0 = 자동
+    "from_sec": "", "to_sec": "", "save_video": True,
+    "norm": "z", "exclude_gk": True, "pos_adjust": True, "pa_learn": True,
     "spec_pv_prox": False, "spec_prog_goaldist": False,
+    "manual_src": None, "manual_dst": None,                # 손으로 보정했을 때만
     "results_dir": str(RESULTS_DIR),
-    # --- 1단계(추적) ---
-    "tracker_dir": "", "preset": "보통 (960 · 2프레임에 1장)",
-    "from_sec": "", "to_sec": "", "track_video": True,
 }
 
 
-def _to_sec(text) -> float | None:
+def _to_sec(text):
     """'90' / '1:30' / '01:30:00' 을 초로. 비어 있으면 None."""
     t = str(text or "").strip()
     if not t:
@@ -83,7 +85,7 @@ def load_config() -> dict:
                     if k in cfg:
                         cfg[k] = v
         except (json.JSONDecodeError, OSError):
-            pass            # 망가진 설정 하나로 프로그램이 안 열리면 안 된다
+            pass
     return cfg
 
 
@@ -96,27 +98,51 @@ def save_config(cfg: dict) -> None:
 
 
 def load_engine() -> types.ModuleType:
-    """
-    계산 엔진을 '새 것'으로 하나 만들어 돌려준다.
-
-    엔진은 설정을 모듈 전역으로 들고 있어서, 한 번 돌린 뒤 그대로 다시 돌리면
-    앞 실행에서 정해진 값(fps, 소유 반경 등)이 남아 다음 결과를 오염시킨다.
-    파일마다 깨끗한 사본을 새로 만들어 쓰면 그 문제가 없다.
-    """
+    """계산 엔진의 새 사본. 파일마다 깨끗한 상태로 돌리려고 매번 새로 만든다."""
     if not ENGINE.exists():
         raise FileNotFoundError(f"계산 엔진을 찾을 수 없습니다: {ENGINE}")
     mod = types.ModuleType("ipi_engine")
     mod.__file__ = str(ENGINE)
-    mod.__name__ = "ipi_engine"          # __main__ 이 아니므로 자동 실행되지 않는다
-    code = compile(ENGINE.read_text(encoding="utf-8"), str(ENGINE), "exec")
-    exec(code, mod.__dict__)
+    mod.__name__ = "ipi_engine"
+    exec(compile(ENGINE.read_text(encoding="utf-8"), str(ENGINE), "exec"), mod.__dict__)
     return mod
 
 
-class QueueWriter(io.TextIOBase):
-    """엔진의 print 출력을 창의 로그로 흘려보낸다."""
+def read_foot_points(csv_path: Path):
+    """tracks.csv 에서 사람 행의 발밑 픽셀 좌표와 팀별 인원을 읽는다."""
+    import pandas as pd
+    df = pd.read_csv(csv_path, usecols=lambda c: c in (
+        "frame", "track_id", "class_name", "team", "fx", "fy", "cx", "cy"))
+    if "class_name" in df.columns:
+        name = df["class_name"].astype(str).str.lower()
+        df = df[~name.str.contains("ball", na=False)]
+    x = df["fx"] if "fx" in df.columns else df.get("cx")
+    y = df["fy"] if "fy" in df.columns else df.get("cy")
+    if x is None or y is None:
+        return None, None, 0
+    ok = x.notna() & y.notna()
+    # 한 팀 인원은 '프레임당 전체 사람 수 / 2' 로 센다.
+    #   팀별로 세면 안 된다 — 골키퍼는 team=-1 로 따로 빠져 있어서
+    #   팀 0/1 은 필드 선수만 세게 되고 한 명씩 모자라게 나온다.
+    per_team = 0
+    if "frame" in df.columns:
+        cnt = df[ok].groupby("frame").size()
+        if len(cnt):
+            per_team = float(cnt.median()) / 2.0
+    return x[ok].to_numpy(float), y[ok].to_numpy(float), per_team
 
-    def __init__(self, q: queue.Queue, tee=None):
+
+def guess_team_size(per_team: float) -> int:
+    """프레임당 인원에서 경기 형식을 짐작한다. 5·7·9·11 중 가까운 쪽."""
+    if not per_team or per_team <= 0:
+        return 11
+    return min((5, 7, 9, 11), key=lambda n: abs(n - per_team))
+
+
+class QueueWriter(io.TextIOBase):
+    """엔진의 print 출력을 창의 로그로."""
+
+    def __init__(self, q, tee=None):
         self.q, self.tee, self.buf = q, tee, ""
 
     def write(self, s):
@@ -145,6 +171,7 @@ class App:
         self.pending: list[Path] = []
         self.worker: threading.Thread | None = None
         self.stop_flag = threading.Event()
+        self.adv_open = False
         for d in (Path(self.cfg["results_dir"]), LOGS_DIR):
             try:
                 Path(d).mkdir(parents=True, exist_ok=True)
@@ -155,27 +182,19 @@ class App:
         self._enable_dnd()
         for arg in sys.argv[1:]:
             self.add_paths([Path(arg)])
-        self.log("준비됐습니다. 경기 영상을 창에 끌어다 놓고 [분석 시작] 을 누르세요.")
-        self.log("영상 -> 좌표 -> 기여도 까지 한 번에 돕니다. "
-                 "이미 뽑아 둔 tracks.csv 를 넣으면 기여도만 계산합니다.")
-        found = self.check_tracker()
-        if found:
-            self.log(f"추적 프로그램을 찾았습니다: {found}")
-        else:
-            self.log("! 추적 프로그램(tracker.py)을 못 찾았습니다. 영상을 분석하려면 "
-                     "창 위의 [찾기] 로 SoccerTracker 폴더를 골라 주세요.", "warn")
-        if not self.cfg.get("homography_src"):
-            self.log("! 좌표가 화면 픽셀이면 [경기장 보정] 을 먼저 해야 합니다. "
-                     "이미 미터 좌표라면 그냥 시작하세요.")
+
+        self.log("경기 영상을 이 창에 끌어다 놓고 [분석 시작] 을 누르세요.", "head")
+        self.log("검출 모델·경기장 보정·인원 파악까지 전부 알아서 합니다.")
         self.root.after(100, self._drain)
+        self.root.after(400, self._check_env)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
         r = self.root
-        r.title("축구 기여도 분석기 — SC · PR · PA · IPI")
-        r.geometry("1010x880")
-        r.minsize(940, 760)
+        r.title("축구 기여도 분석기")
+        r.geometry("980x760")
+        r.minsize(900, 680)
         r.configure(bg=BG)
 
         style = ttk.Style()
@@ -187,161 +206,57 @@ class App:
         style.configure("TLabel", background=BG, foreground=FG)
         style.configure("Muted.TLabel", background=BG, foreground=MUTED)
         style.configure("Head.TLabel", background=BG, foreground=FG,
-                        font=("Malgun Gothic", 15, "bold"))
-        style.configure("Sec.TLabel", background=BG, foreground=ACCENT,
-                        font=("Malgun Gothic", 10, "bold"))
+                        font=("Malgun Gothic", 16, "bold"))
         style.configure("TCheckbutton", background=BG, foreground=FG)
         style.map("TCheckbutton", background=[("active", BG)])
         style.configure("TButton", padding=6)
-        style.configure("Go.TButton", padding=8, font=("Malgun Gothic", 10, "bold"))
+        style.configure("Go.TButton", padding=(18, 12),
+                        font=("Malgun Gothic", 12, "bold"))
         style.configure("TProgressbar", troughcolor=PANEL, background=ACCENT,
-                        borderwidth=0, thickness=8)
+                        borderwidth=0, thickness=10)
         style.configure("TEntry", fieldbackground=PANEL, foreground=FG)
         style.configure("TCombobox", fieldbackground=PANEL, foreground=FG)
-        # clam 테마의 읽기전용 콤보박스는 글자가 배경에 묻힌다. 직접 지정한다.
-        style.map("TCombobox",
-                  fieldbackground=[("readonly", PANEL)],
+        style.map("TCombobox", fieldbackground=[("readonly", PANEL)],
                   foreground=[("readonly", FG)],
                   selectbackground=[("readonly", PANEL)],
                   selectforeground=[("readonly", FG)])
-
-        pad = {"padx": 14}
+        pad = {"padx": 16}
 
         head = ttk.Frame(r)
-        head.pack(fill="x", pady=(14, 4), **pad)
+        head.pack(fill="x", pady=(16, 2), **pad)
         ttk.Label(head, text="축구 기여도 분석기", style="Head.TLabel").pack(side="left")
-        ttk.Label(head, text="선수 좌표에서 공간 통제·압박·패스 유인을 계산해 IPI 로 냅니다",
+        ttk.Label(head, text="영상을 넣고 시작만 누르면 선수별 기여도까지 나옵니다",
                   style="Muted.TLabel").pack(side="left", padx=(12, 0))
-
-        # --- 1단계 · 추적 설정 -------------------------------------------
-        t1 = ttk.Frame(r)
-        t1.pack(fill="x", pady=(10, 2), **pad)
-        ttk.Label(t1, text="1단계 · 영상 → 좌표", style="Sec.TLabel").grid(
-            row=0, column=0, sticky="w", padx=(0, 12))
-        ttk.Label(t1, text="추적 품질").grid(row=0, column=1, sticky="w")
-        self.preset_var = tk.StringVar(value=self.cfg["preset"])
-        ttk.Combobox(t1, textvariable=self.preset_var, width=24, state="readonly",
-                     values=list(pipeline.PRESETS.keys())).grid(row=0, column=2, padx=(6, 14))
-        ttk.Label(t1, text="구간").grid(row=0, column=3, sticky="w")
-        self.from_var = tk.StringVar(value=self.cfg["from_sec"])
-        self.to_var = tk.StringVar(value=self.cfg["to_sec"])
-        ttk.Entry(t1, textvariable=self.from_var, width=7).grid(row=0, column=4, padx=(6, 2))
-        ttk.Label(t1, text="~").grid(row=0, column=5)
-        ttk.Entry(t1, textvariable=self.to_var, width=7).grid(row=0, column=6, padx=(2, 4))
-        ttk.Label(t1, text="예 12:00 ~ 15:00 · 비우면 전체",
-                  style="Muted.TLabel").grid(row=0, column=7, sticky="w", padx=(0, 14))
-        self.tvid_var = tk.BooleanVar(value=self.cfg["track_video"])
-        ttk.Checkbutton(t1, text="확인용 영상", variable=self.tvid_var).grid(row=0, column=8)
-
-        t2 = ttk.Frame(r)
-        t2.pack(fill="x", pady=(2, 2), **pad)
-        ttk.Label(t2, text="추적 프로그램").pack(side="left")
-        self.tdir_var = tk.StringVar(value=self.cfg["tracker_dir"])
-        ttk.Entry(t2, textvariable=self.tdir_var, width=54).pack(side="left", padx=6)
-        ttk.Button(t2, text="찾기", command=self.pick_tracker).pack(side="left")
-        self.tdir_lbl = tk.Label(t2, bg=BG, fg=MUTED, text="")
-        self.tdir_lbl.pack(side="left", padx=10)
-
-        ttk.Separator(r, orient="horizontal").pack(fill="x", padx=14, pady=(8, 2))
-        ttk.Label(r, text="2단계 · 좌표 → 기여도", style="Sec.TLabel").pack(
-            anchor="w", padx=14, pady=(4, 0))
-
-        # --- 경기 설정 ---------------------------------------------------
-        o1 = ttk.Frame(r)
-        o1.pack(fill="x", pady=(8, 2), **pad)
-        ttk.Label(o1, text="경기장").grid(row=0, column=0, sticky="w")
-        self.pl_var = tk.StringVar(value=str(self.cfg["pitch_l"]))
-        self.pw_var = tk.StringVar(value=str(self.cfg["pitch_w"]))
-        ttk.Entry(o1, textvariable=self.pl_var, width=6).grid(row=0, column=1, padx=(6, 2))
-        ttk.Label(o1, text="x").grid(row=0, column=2)
-        ttk.Entry(o1, textvariable=self.pw_var, width=6).grid(row=0, column=3, padx=(2, 4))
-        ttk.Label(o1, text="m", style="Muted.TLabel").grid(row=0, column=4, padx=(0, 16))
-
-        ttk.Label(o1, text="한 팀 인원").grid(row=0, column=5, sticky="w")
-        self.ts_var = tk.StringVar(value=str(self.cfg["team_size"]))
-        ttk.Spinbox(o1, textvariable=self.ts_var, width=5, from_=3, to=11
-                    ).grid(row=0, column=6, padx=(6, 16))
-
-        ttk.Label(o1, text="fps").grid(row=0, column=7, sticky="w")
-        self.fps_var = tk.StringVar(value=str(self.cfg["fps"]))
-        ttk.Entry(o1, textvariable=self.fps_var, width=6).grid(row=0, column=8, padx=(6, 2))
-        ttk.Label(o1, text="비우면 자동", style="Muted.TLabel").grid(row=0, column=9, sticky="w")
-
-        o2 = ttk.Frame(r)
-        o2.pack(fill="x", pady=2, **pad)
-        ttk.Label(o2, text="팀 이름").grid(row=0, column=0, sticky="w")
-        self.ta_var = tk.StringVar(value=self.cfg["team_a"])
-        self.tb_var = tk.StringVar(value=self.cfg["team_b"])
-        ttk.Entry(o2, textvariable=self.ta_var, width=10).grid(row=0, column=1, padx=(6, 2))
-        ttk.Label(o2, text="/").grid(row=0, column=2)
-        ttk.Entry(o2, textvariable=self.tb_var, width=10).grid(row=0, column=3, padx=(2, 4))
-        ttk.Label(o2, text="비우면 파일의 값 그대로 (tracker 는 0 / 1)",
-                  style="Muted.TLabel").grid(row=0, column=4, sticky="w", padx=(0, 18))
-
-        ttk.Label(o2, text="정규화").grid(row=0, column=5, sticky="w")
-        self.norm_var = tk.StringVar(value=self.cfg["norm"])
-        ttk.Combobox(o2, textvariable=self.norm_var, width=7, state="readonly",
-                     values=["z", "rank"]).grid(row=0, column=6, padx=(6, 6))
-        ttk.Label(o2, text="z = 방법론 문서 값 (수식 14)",
-                  style="Muted.TLabel").grid(row=0, column=7, sticky="w")
-
-        # --- 경기장 보정 -------------------------------------------------
-        o3 = ttk.Frame(r)
-        o3.pack(fill="x", pady=(8, 2), **pad)
-        ttk.Button(o3, text="경기장 보정  (영상에서 기준점 찍기)",
-                   command=self.calibrate).pack(side="left")
-        self.calib_lbl = tk.Label(o3, bg=BG, fg=MUTED, text="")
-        self.calib_lbl.pack(side="left", padx=10)
-        ttk.Button(o3, text="보정 지우기", command=self.clear_calib).pack(side="right")
-        self._show_calib()
-
-        # --- 체크박스 ----------------------------------------------------
-        o4 = ttk.Frame(r)
-        o4.pack(fill="x", pady=(6, 8), **pad)
-        self.gk_var = tk.BooleanVar(value=self.cfg["exclude_gk"])
-        self.pos_var = tk.BooleanVar(value=self.cfg["pos_adjust"])
-        self.learn_var = tk.BooleanVar(value=self.cfg["pa_learn"])
-        self.plot_var = tk.BooleanVar(value=self.cfg["save_plot"])
-        self.ref_var = tk.BooleanVar(value=self.cfg["drop_referee"])
-        self.sw1_var = tk.BooleanVar(value=self.cfg["spec_pv_prox"])
-        self.sw2_var = tk.BooleanVar(value=self.cfg["spec_prog_goaldist"])
-        for text, var in (("골키퍼 제외", self.gk_var),
-                          ("포지션 보정", self.pos_var),
-                          ("PA 지수 학습", self.learn_var),
-                          ("그림 저장", self.plot_var),
-                          ("심판 제외", self.ref_var)):
-            ttk.Checkbutton(o4, text=text, variable=var).pack(side="left", padx=(0, 12))
-        ttk.Label(o4, text="|  문서와 다르게:", style="Muted.TLabel").pack(side="left", padx=(6, 8))
-        ttk.Checkbutton(o4, text="압박 속도항에 거리 반영", variable=self.sw1_var
-                        ).pack(side="left", padx=(0, 10))
-        ttk.Checkbutton(o4, text="전진가치를 골대거리로", variable=self.sw2_var
-                        ).pack(side="left")
 
         # --- 대기열 ------------------------------------------------------
         qf = ttk.Frame(r)
-        qf.pack(fill="x", pady=(4, 6), **pad)
+        qf.pack(fill="x", pady=(12, 6), **pad)
         bar = ttk.Frame(qf)
         bar.pack(fill="x")
-        ttk.Label(bar, text="분석할 영상 / 좌표 파일").pack(side="left")
+        ttk.Label(bar, text="분석할 영상").pack(side="left")
+        ttk.Label(bar, text="  (창에 끌어다 놓아도 됩니다)",
+                  style="Muted.TLabel").pack(side="left")
         ttk.Button(bar, text="영상 추가", command=self.pick_videos).pack(side="right")
-        ttk.Button(bar, text="좌표 파일 추가", command=self.pick_files).pack(side="right", padx=6)
         ttk.Button(bar, text="비우기", command=self.clear_queue).pack(side="right", padx=6)
-        self.listbox = tk.Listbox(qf, height=5, bg=PANEL, fg=FG, borderwidth=0,
+        self.listbox = tk.Listbox(qf, height=6, bg=PANEL, fg=FG, borderwidth=0,
                                   highlightthickness=1, highlightbackground="#2a313d",
-                                  selectbackground=ACCENT, activestyle="none")
-        self.listbox.pack(fill="x", pady=(4, 0))
+                                  selectbackground=ACCENT, activestyle="none",
+                                  font=("Malgun Gothic", 10))
+        self.listbox.pack(fill="x", pady=(6, 0))
 
         # --- 실행 --------------------------------------------------------
         run = ttk.Frame(r)
-        run.pack(fill="x", pady=8, **pad)
-        self.start_btn = ttk.Button(run, text="▶  분석 시작", style="Go.TButton",
+        run.pack(fill="x", pady=(12, 6), **pad)
+        self.start_btn = ttk.Button(run, text="▶   분석 시작", style="Go.TButton",
                                     command=self.start)
         self.start_btn.pack(side="left")
         self.stop_btn = ttk.Button(run, text="■  중지", command=self.stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=8)
+        self.stop_btn.pack(side="left", padx=10)
         ttk.Button(run, text="결과 폴더 열기",
                    command=lambda: self.open_folder(Path(self.cfg["results_dir"]))
                    ).pack(side="right")
+        self.adv_btn = ttk.Button(run, text="고급 설정  ▼", command=self.toggle_adv)
+        self.adv_btn.pack(side="right", padx=8)
 
         prog = ttk.Frame(r)
         prog.pack(fill="x", **pad)
@@ -350,9 +265,61 @@ class App:
         self.status = ttk.Label(prog, text="대기 중", style="Muted.TLabel")
         self.status.pack(anchor="w", pady=(4, 0))
 
+        # --- 고급 설정 (기본은 접혀 있다) ---------------------------------
+        self.adv = ttk.Frame(r)
+        a1 = ttk.Frame(self.adv)
+        a1.pack(fill="x", pady=(8, 2))
+        ttk.Label(a1, text="경기장").grid(row=0, column=0, sticky="w")
+        self.pl_var = tk.StringVar(value=str(self.cfg["pitch_l"]))
+        self.pw_var = tk.StringVar(value=str(self.cfg["pitch_w"]))
+        ttk.Entry(a1, textvariable=self.pl_var, width=6).grid(row=0, column=1, padx=(6, 2))
+        ttk.Label(a1, text="x").grid(row=0, column=2)
+        ttk.Entry(a1, textvariable=self.pw_var, width=6).grid(row=0, column=3, padx=(2, 4))
+        ttk.Label(a1, text="m", style="Muted.TLabel").grid(row=0, column=4, padx=(0, 16))
+        ttk.Label(a1, text="한 팀 인원").grid(row=0, column=5, sticky="w")
+        self.ts_var = tk.StringVar(value=str(self.cfg["team_size"] or "자동"))
+        ttk.Combobox(a1, textvariable=self.ts_var, width=6, state="readonly",
+                     values=["자동", "5", "7", "9", "11"]).grid(row=0, column=6, padx=(6, 16))
+        ttk.Label(a1, text="구간").grid(row=0, column=7, sticky="w")
+        self.from_var = tk.StringVar(value=self.cfg["from_sec"])
+        self.to_var = tk.StringVar(value=self.cfg["to_sec"])
+        ttk.Entry(a1, textvariable=self.from_var, width=7).grid(row=0, column=8, padx=(6, 2))
+        ttk.Label(a1, text="~").grid(row=0, column=9)
+        ttk.Entry(a1, textvariable=self.to_var, width=7).grid(row=0, column=10, padx=(2, 4))
+        ttk.Label(a1, text="예 12:00 ~ 15:00 · 비우면 전체",
+                  style="Muted.TLabel").grid(row=0, column=11, sticky="w")
+
+        a2 = ttk.Frame(self.adv)
+        a2.pack(fill="x", pady=2)
+        self.vid_var = tk.BooleanVar(value=self.cfg["save_video"])
+        self.gk_var = tk.BooleanVar(value=self.cfg["exclude_gk"])
+        self.pos_var = tk.BooleanVar(value=self.cfg["pos_adjust"])
+        self.learn_var = tk.BooleanVar(value=self.cfg["pa_learn"])
+        self.sw1_var = tk.BooleanVar(value=self.cfg["spec_pv_prox"])
+        self.sw2_var = tk.BooleanVar(value=self.cfg["spec_prog_goaldist"])
+        for text, var in (("박스 그린 확인용 영상", self.vid_var),
+                          ("골키퍼 제외", self.gk_var),
+                          ("포지션 보정", self.pos_var),
+                          ("PA 지수 학습", self.learn_var)):
+            ttk.Checkbutton(a2, text=text, variable=var).pack(side="left", padx=(0, 12))
+        ttk.Label(a2, text="|  문서와 다르게:", style="Muted.TLabel").pack(side="left", padx=(4, 8))
+        ttk.Checkbutton(a2, text="압박 속도항에 거리 반영", variable=self.sw1_var
+                        ).pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(a2, text="전진가치를 골대거리로", variable=self.sw2_var).pack(side="left")
+
+        a3 = ttk.Frame(self.adv)
+        a3.pack(fill="x", pady=(2, 6))
+        ttk.Label(a3, text="경기장 보정").pack(side="left")
+        self.calib_lbl = tk.Label(a3, bg=BG, fg=MUTED, text="")
+        self.calib_lbl.pack(side="left", padx=10)
+        ttk.Button(a3, text="손으로 보정하기", command=self.calibrate).pack(side="right")
+        ttk.Button(a3, text="자동으로 되돌리기", command=self.clear_calib
+                   ).pack(side="right", padx=6)
+        self._show_calib()
+
         # --- 로그 --------------------------------------------------------
         lf = ttk.Frame(r)
-        lf.pack(fill="both", expand=True, pady=(8, 14), **pad)
+        lf.pack(fill="both", expand=True, pady=(10, 14), **pad)
         self.logbox = tk.Text(lf, bg=PANEL, fg=FG, borderwidth=0, highlightthickness=1,
                               highlightbackground="#2a313d", wrap="word", state="disabled",
                               font=("Consolas", 9), padx=10, pady=8)
@@ -364,6 +331,15 @@ class App:
         self.logbox.tag_configure("ok", foreground=OKC)
         self.logbox.tag_configure("head", foreground=ACCENT)
 
+    def toggle_adv(self):
+        if self.adv_open:
+            self.adv.pack_forget()
+            self.adv_btn.configure(text="고급 설정  ▼")
+        else:
+            self.adv.pack(fill="x", padx=16, before=self.logbox.master)
+            self.adv_btn.configure(text="고급 설정  ▲")
+        self.adv_open = not self.adv_open
+
     def _enable_dnd(self):
         try:
             self.root.drop_target_register("DND_Files")      # type: ignore[attr-defined]
@@ -374,15 +350,31 @@ class App:
     def _on_drop(self, event):
         self.add_paths([Path(p) for p in self.root.tk.splitlist(event.data)])
 
+    def _check_env(self):
+        """시작할 때 환경을 한 번 살펴 준비 상태를 알려 준다."""
+        miss = [m for m in ("torch", "ultralytics") if not _have(m)]
+        if miss:
+            self.log(f"! 영상 분석에 필요한 {', '.join(miss)} 가 없습니다. "
+                     f"setup.bat 을 한 번 실행하면 설치됩니다.", "warn")
+        player, ball = autotrack.local_models()
+        if player:
+            self.log(f"검출 모델 준비됨: {player.name}"
+                     + (f" · {ball.name}" if ball else ""), "ok")
+        else:
+            self.log("검출 모델은 처음 분석할 때 자동으로 마련합니다 (몇 분 걸립니다).")
+        if autotrack.has_gpu():
+            self.log("GPU 를 쓸 수 있습니다 — 빠르게 돌아갑니다.", "ok")
+        else:
+            self.log("GPU 가 없어 CPU 로 돕니다. 영상 길이의 서너 배가 걸리니 "
+                     "처음에는 짧은 영상이나 [고급 설정] 의 구간을 쓰세요.")
+
     # -------------------------------------------------------------- 대기열
     def add_paths(self, paths):
-        """영상과 좌표 파일을 둘 다 받는다. 영상은 1단계부터, 좌표는 2단계부터."""
         added = 0
         for p in paths:
             found = []
             if p.is_dir():
-                for ext in ("*.mp4", "*.avi", "*.mov", "*.mkv", "*.m4v", "*.webm",
-                            "*.csv", "*.xlsx", "*.xls"):
+                for ext in ("*.mp4", "*.avi", "*.mov", "*.mkv", "*.m4v", "*.webm"):
                     found += sorted(p.rglob(ext))
             elif p.is_file() and (pipeline.is_video(p)
                                   or p.suffix.lower() in pipeline.DATA_EXT):
@@ -391,56 +383,19 @@ class App:
                 if f not in self.pending:
                     self.pending.append(f)
                     kind = "영상" if pipeline.is_video(f) else "좌표"
-                    self.listbox.insert("end", f"  [{kind}]  {f.name}      ({f.parent})")
+                    self.listbox.insert("end", f"   [{kind}]  {f.name}")
                     added += 1
         if added:
-            n_v = sum(1 for f in self.pending if pipeline.is_video(f))
-            self.log(f"{added}개 추가 (대기 {len(self.pending)}개 — "
-                     f"영상 {n_v}개 · 좌표 {len(self.pending) - n_v}개)")
+            self.log(f"{added}개 추가 (대기 {len(self.pending)}개)")
         return added
 
     def pick_videos(self):
         files = filedialog.askopenfilenames(
             title="분석할 경기 영상 선택",
             filetypes=[("영상 파일", "*.mp4 *.avi *.mov *.mkv *.m4v *.webm"),
-                       ("모든 파일", "*.*")])
+                       ("좌표 파일", "*.csv *.xlsx"), ("모든 파일", "*.*")])
         if files:
             self.add_paths([Path(f) for f in files])
-
-    def pick_files(self):
-        files = filedialog.askopenfilenames(
-            title="선수 좌표 파일 선택 (tracks.csv 등)",
-            filetypes=[("좌표 파일", DATA_EXT), ("모든 파일", "*.*")])
-        if files:
-            self.add_paths([Path(f) for f in files])
-
-    # --------------------------------------------------- 추적 프로그램 찾기
-    def pick_tracker(self):
-        d = filedialog.askdirectory(title="SoccerTracker 폴더 선택 (tracker.py 가 있는 곳)")
-        if d:
-            self.tdir_var.set(d)
-            self.check_tracker(verbose=True)
-
-    def check_tracker(self, verbose=False):
-        """추적 프로그램을 쓸 수 있는 상태인지 확인하고 표시한다."""
-        found = pipeline.find_soccertracker(self.tdir_var.get().strip(), ROOT)
-        if not found:
-            self.tdir_lbl.configure(text="못 찾음 — 영상을 분석하려면 필요합니다", fg=WARN)
-            if verbose:
-                self.log("! tracker.py 가 있는 폴더를 고르세요. "
-                         "(SoccerTracker.exe·START.bat 이 있는 그 폴더입니다)", "warn")
-            return None
-        self.tdir_var.set(str(found))
-        miss = pipeline.missing_packages(found)
-        if miss:
-            self.tdir_lbl.configure(
-                text=f"찾음 — 그런데 {', '.join(miss)} 가 없습니다", fg=WARN)
-            if verbose:
-                self.log(f"! 추적에 필요한 {', '.join(miss)} 가 지금 파이썬에 없습니다. "
-                         f"SoccerTracker 의 venv 로 이 프로그램을 실행하면 해결됩니다.", "warn")
-        else:
-            self.tdir_lbl.configure(text="사용 가능", fg=OKC)
-        return found
 
     def clear_queue(self):
         if self._busy():
@@ -450,41 +405,40 @@ class App:
         self.listbox.delete(0, "end")
 
     # ------------------------------------------------------------- 보정
-    def calibrate(self, video_hint: str | None = None):
+    def calibrate(self, video_hint=None):
         try:
             from calibrate import CalibrateWindow
         except ImportError as exc:
-            messagebox.showerror("보정 창을 열 수 없음", f"calibrate.py 를 찾지 못했습니다.\n{exc}")
+            messagebox.showerror("보정 창을 열 수 없음", f"calibrate.py 가 없습니다.\n{exc}")
             return
         try:
             pl, pw = float(self.pl_var.get()), float(self.pw_var.get())
         except ValueError:
-            messagebox.showwarning("경기장 크기", "경기장 크기를 숫자로 넣어 주세요.")
-            return
+            pl, pw = 105.0, 68.0
+        hint = video_hint or next((str(p) for p in self.pending if pipeline.is_video(p)), None)
 
         def done(src, dst):
-            self.cfg["homography_src"] = [list(map(float, p)) for p in src]
-            self.cfg["homography_dst"] = [list(map(float, p)) for p in dst]
+            self.cfg["manual_src"] = [list(map(float, p)) for p in src]
+            self.cfg["manual_dst"] = [list(map(float, p)) for p in dst]
             save_config(self.cfg)
             self._show_calib()
-            self.log(f"경기장 보정 완료 — 기준점 {len(src)}개를 저장했습니다.", "ok")
+            self.log(f"손으로 보정했습니다 — 기준점 {len(src)}개. "
+                     f"이제 자동 보정 대신 이 값을 씁니다.", "ok")
 
-        CalibrateWindow(self.root, pl, pw, on_done=done, video_hint=video_hint)
+        CalibrateWindow(self.root, pl, pw, on_done=done, video_hint=hint)
 
     def clear_calib(self):
-        self.cfg["homography_src"] = self.cfg["homography_dst"] = None
+        self.cfg["manual_src"] = self.cfg["manual_dst"] = None
         save_config(self.cfg)
         self._show_calib()
-        self.log("경기장 보정을 지웠습니다. 좌표를 이미 미터로 가진 파일에만 쓰세요.")
+        self.log("자동 보정으로 되돌렸습니다.")
 
     def _show_calib(self):
-        src = self.cfg.get("homography_src")
-        if src:
-            self.calib_lbl.configure(text=f"보정됨 — 기준점 {len(src)}개 (픽셀 → 미터 변환을 합니다)",
-                                     fg=OKC)
+        if self.cfg.get("manual_src"):
+            self.calib_lbl.configure(
+                text=f"손으로 지정한 기준점 {len(self.cfg['manual_src'])}개를 씁니다", fg=OKC)
         else:
-            self.calib_lbl.configure(text="보정 안 됨 — 파일의 좌표를 이미 미터로 보고 계산합니다",
-                                     fg=MUTED)
+            self.calib_lbl.configure(text="자동 — 영상의 흰 선을 찾아 스스로 맞춥니다", fg=MUTED)
 
     # ------------------------------------------------------------- 실행
     def _busy(self):
@@ -496,21 +450,14 @@ class App:
                 return float(var.get())
             except ValueError:
                 return default
+        ts = self.ts_var.get().strip()
         self.cfg.update({
             "pitch_l": f(self.pl_var, 105.0), "pitch_w": f(self.pw_var, 68.0),
-            "team_size": int(f(self.ts_var, 11)),
-            "fps": self.fps_var.get().strip(), "norm": self.norm_var.get(),
-            "team_a": self.ta_var.get().strip(), "team_b": self.tb_var.get().strip(),
-            "exclude_gk": self.gk_var.get(), "pos_adjust": self.pos_var.get(),
-            "pa_learn": self.learn_var.get(), "save_plot": self.plot_var.get(),
-            "drop_referee": self.ref_var.get(),
-            "spec_pv_prox": self.sw1_var.get(),
-            "spec_prog_goaldist": self.sw2_var.get(),
-            "tracker_dir": self.tdir_var.get().strip(),
-            "preset": self.preset_var.get(),
-            "from_sec": self.from_var.get().strip(),
-            "to_sec": self.to_var.get().strip(),
-            "track_video": self.tvid_var.get(),
+            "team_size": 0 if ts in ("자동", "") else int(ts),
+            "from_sec": self.from_var.get().strip(), "to_sec": self.to_var.get().strip(),
+            "save_video": self.vid_var.get(), "exclude_gk": self.gk_var.get(),
+            "pos_adjust": self.pos_var.get(), "pa_learn": self.learn_var.get(),
+            "spec_pv_prox": self.sw1_var.get(), "spec_prog_goaldist": self.sw2_var.get(),
         })
         save_config(self.cfg)
         return self.cfg
@@ -519,53 +466,18 @@ class App:
         if self._busy():
             return
         if not self.pending:
-            messagebox.showinfo("넣은 것이 없습니다",
-                                "경기 영상을 창에 끌어다 놓거나 [영상 추가] 로 고르세요.\n\n"
-                                "이미 뽑아 둔 tracks.csv 가 있다면 [좌표 파일 추가] 로 넣으면\n"
-                                "추적을 건너뛰고 기여도만 계산합니다.")
+            messagebox.showinfo("영상이 없습니다",
+                                "경기 영상을 창에 끌어다 놓거나 [영상 추가] 로 고르세요.")
             return
         cfg = self.collect()
-        files = list(self.pending)
-        videos = [f for f in files if pipeline.is_video(f)]
-
-        if videos:
-            if not self.check_tracker():
-                messagebox.showwarning(
-                    "추적 프로그램이 필요합니다",
-                    "영상을 분석하려면 SoccerTracker 폴더(tracker.py 가 있는 곳)를\n"
-                    "창 위의 [찾기] 로 골라 주세요.\n\n"
-                    "이미 뽑아 둔 tracks.csv 만 넣으면 이 단계는 필요 없습니다.")
-                return
-            if not cfg.get("homography_src"):
-                go = messagebox.askyesnocancel(
-                    "경기장 보정을 먼저 하시겠습니까?",
-                    "영상에서 나오는 좌표는 화면 픽셀입니다.\n"
-                    "카메라가 비스듬히 찍으므로 화면 위와 아래의 1 m 가 서로 달라,\n"
-                    "미터로 바꾸지 않으면 기여도 계산이 성립하지 않습니다.\n\n"
-                    "[예]  지금 보정합니다 (영상 한 장면에서 기준점 4개를 클릭)\n"
-                    "[아니오]  보정 없이 그냥 진행합니다 (좌표가 이미 미터일 때만)\n"
-                    "[취소]  그만둡니다")
-                if go is None:
-                    return
-                if go:
-                    self.calibrate(video_hint=str(videos[0]))
-                    self.log("보정을 마친 뒤 [분석 시작] 을 다시 눌러 주세요.")
-                    return
+        items = list(self.pending)
         self.stop_flag.clear()
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.progress.configure(value=0)
-        n_v = len(videos)
-        self.log(f"── 분석 시작 · 영상 {n_v}개 · 좌표 {len(files) - n_v}개 "
-                 f"· 경기장 {cfg['pitch_l']:g}x{cfg['pitch_w']:g} m "
-                 f"· {cfg['team_size']}명 ──", "head")
-        if n_v:
-            self.log(f"   추적 품질: {cfg['preset']}"
-                     + (f" · 구간 {cfg['from_sec'] or '처음'} ~ {cfg['to_sec'] or '끝'}"
-                        if (cfg['from_sec'] or cfg['to_sec']) else " · 전체 구간"))
-            self.log("   영상 길이에 따라 몇 십 분에서 몇 시간이 걸립니다. "
-                     "처음이면 3~5분 구간만 먼저 돌려 보세요.")
-        self.worker = threading.Thread(target=self._run, args=(files, dict(cfg)), daemon=True)
+        self.log(f"\n── 분석 시작 · {len(items)}개 ──", "head")
+        self.worker = threading.Thread(target=self._run, args=(items, dict(cfg)),
+                                       daemon=True)
         self.worker.start()
 
     def stop(self):
@@ -573,27 +485,28 @@ class App:
         self.status.configure(text="중지 요청 — 지금 단계가 끝나면 멈춥니다")
 
     def _run(self, items, cfg):
-        """영상이면 1단계부터, 좌표 파일이면 2단계부터."""
         done = 0
         out_root = Path(cfg["results_dir"])
         for item in items:
             if self.stop_flag.is_set():
                 break
             try:
+                self.q.put(("log", f"\n[{item.name}]", "head"))
                 if pipeline.is_video(item):
                     csv_path = self._track(item, cfg, out_root)
                     if csv_path is None:
                         continue
                     out_dir = csv_path.parent
+                    video = item
                 else:
-                    csv_path = item
-                    out_dir = out_root / item.stem
+                    csv_path, out_dir, video = item, out_root / item.stem, None
                     out_dir.mkdir(parents=True, exist_ok=True)
                 if self.stop_flag.is_set():
                     break
-                if self._analyze(csv_path, cfg, out_dir):
+                H, calib_note = self._calibrate(video, csv_path, cfg)
+                if self._analyze(csv_path, cfg, out_dir, H, calib_note):
                     done += 1
-            except Exception as exc:                      # noqa: BLE001
+            except Exception as exc:                          # noqa: BLE001
                 self.q.put(("log", f"  오류: {type(exc).__name__}: {exc}", "warn"))
                 for line in traceback.format_exc().splitlines()[-6:]:
                     self.q.put(("log", "    " + line))
@@ -601,57 +514,79 @@ class App:
 
     # ------------------------------------------------------- 1단계 · 추적
     def _track(self, video: Path, cfg, out_root: Path):
-        """영상 하나를 추적해 tracks.csv 를 만든다. 실패하면 None."""
-        self.q.put(("log", f"\n[{video.name}]", "head"))
-        self.q.put(("log", "  1단계 · 영상에서 선수와 공의 위치를 찾는 중", "head"))
-        folder = pipeline.find_soccertracker(cfg.get("tracker_dir"), ROOT)
-        if not folder:
-            self.q.put(("log", "  추적 프로그램(tracker.py)을 찾지 못했습니다. "
-                               "창 위의 [찾기] 로 SoccerTracker 폴더를 골라 주세요.", "warn"))
-            return None
-        miss = pipeline.missing_packages(folder)
-        if miss:
-            self.q.put(("log", f"  추적에 필요한 {', '.join(miss)} 가 없습니다.", "warn"))
-            self.q.put(("log", "  SoccerTracker 폴더의 START.bat 을 한 번 실행해 설치를 끝낸 뒤, "
-                               "이 프로그램을 다시 열어 주세요.", "warn"))
-            return None
-
-        lo = _to_sec(cfg.get("from_sec"))
+        self.q.put(("log", "  1 / 3  영상에서 선수와 공을 찾는 중", "head"))
+        self.q.put(("stage", "준비", 0, 1))
+        for m in ("torch", "ultralytics"):
+            if not _have(m):
+                self.q.put(("log", f"  {m} 가 없어 영상을 분석할 수 없습니다. "
+                                   f"setup.bat 을 한 번 실행하세요.", "warn"))
+                return None
+        lo = _to_sec(cfg.get("from_sec")) or 0.0
         hi = _to_sec(cfg.get("to_sec"))
-        if hi is not None and lo is not None and hi <= lo:
-            self.q.put(("log", "  구간의 끝이 시작보다 앞입니다. 구간을 무시하고 전체를 봅니다.", "warn"))
+        if hi is not None and hi <= lo:
+            self.q.put(("log", "  구간의 끝이 시작보다 앞입니다. 전체를 봅니다.", "warn"))
             lo, hi = 0.0, None
-
-        def log(msg):
-            self.q.put(("log", "  " + str(msg)))
-
-        def prog(cur, total, eta=0.0):
-            self.q.put(("stage", "추적", cur, max(total, 1)))
-
         t0 = time.time()
-        csv_path, summary = pipeline.run_tracking(
-            folder, video, out_root, cfg.get("preset", ""),
-            bool(cfg.get("track_video", True)),
-            log=log, on_progress=prog, should_stop=self.stop_flag.is_set,
-            start_sec=lo or 0.0, end_sec=hi)
+        csv_path, summary = autotrack.track(
+            video, out_root,
+            log=lambda m: self.q.put(("log", "  " + str(m))),
+            on_progress=lambda c, t, e=0.0: self.q.put(("stage", "영상 분석", c, max(t, 1))),
+            should_stop=self.stop_flag.is_set,
+            start_sec=lo, end_sec=hi, save_video=bool(cfg.get("save_video", True)))
         if self.stop_flag.is_set():
             self.q.put(("log", "  중지했습니다.", "warn"))
             return None
         if csv_path is None or not Path(csv_path).exists():
-            self.q.put(("log", "  좌표 파일이 만들어지지 않았습니다.", "warn"))
+            self.q.put(("log", "  좌표를 만들지 못했습니다.", "warn"))
             return None
-
         summary = summary or pipeline.read_summary(csv_path)
-        self.q.put(("log", f"  좌표 완료 ({time.time() - t0:.0f}초) -> {csv_path.name}", "ok"))
-        for grade, line in pipeline.check_tracking(summary, int(cfg["team_size"])):
+        self.q.put(("log", f"  좌표 완료 ({time.time() - t0:.0f}초)", "ok"))
+        size = int(cfg["team_size"]) or 11
+        for grade, line in pipeline.check_tracking(summary, size):
             self.q.put(("log", "  " + line, grade if grade == "warn" else "ok"))
         return Path(csv_path)
 
-    # ----------------------------------------------------- 2단계 · 기여도
-    def _analyze(self, csv_path: Path, cfg, out_dir: Path) -> bool:
-        """좌표 파일에서 기여도를 계산한다."""
-        self.q.put(("log", f"  2단계 · 좌표에서 기여도를 계산하는 중", "head"))
-        self.q.put(("stage", "기여도 준비", 0, 1))
+    # ------------------------------------------------------- 2단계 · 보정
+    def _calibrate(self, video, csv_path: Path, cfg):
+        """화면 픽셀을 미터로 바꾸는 변환을 마련한다. (H, 설명)"""
+        if cfg.get("manual_src") and cfg.get("manual_dst"):
+            H = autocalib.homography(cfg["manual_src"], cfg["manual_dst"])
+            self.q.put(("log", "  2 / 3  경기장 보정 — 손으로 지정한 기준점을 씁니다", "head"))
+            return H, "손으로 지정"
+        if video is None:
+            return None, "없음 (좌표 파일은 이미 미터로 봅니다)"
+        self.q.put(("log", "  2 / 3  경기장 보정 — 흰 선을 찾아 미터로 바꾸는 중", "head"))
+        self.q.put(("stage", "경기장 보정", 0, 1))
+        try:
+            px, py, per_team = read_foot_points(csv_path)
+        except Exception as exc:                              # noqa: BLE001
+            self.q.put(("log", f"  좌표를 못 읽었습니다: {exc}", "warn"))
+            return None, "실패"
+        if px is None or len(px) < 100:
+            self.q.put(("log", "  선수 좌표가 너무 적어 보정을 할 수 없습니다.", "warn"))
+            return None, "실패"
+        if not int(cfg["team_size"]):
+            guess = guess_team_size(per_team)
+            cfg["team_size"] = guess
+            self.q.put(("log", f"  프레임당 한 팀 {per_team:.0f}명 -> {guess}명 경기로 봅니다"))
+        H, how, score, note = autocalib.calibrate(
+            video, (px, py), float(cfg["pitch_l"]), float(cfg["pitch_w"]),
+            log=lambda m: self.q.put(("log", "  " + str(m))))
+        if H is None:
+            self.q.put(("log", f"  보정 실패 — {note}", "warn"))
+            self.q.put(("log", "  좌표를 미터로 바꾸지 못해 기여도 값은 의미가 없습니다. "
+                               "[고급 설정] 의 [손으로 보정하기] 를 써 주세요.", "warn"))
+            return None, "실패"
+        self.q.put(("log", f"  보정 완료 — {how} (점수 {score:.2f})",
+                    "ok" if score >= 0.8 and how == "흰 선" else "warn"))
+        if note:
+            self.q.put(("log", "  " + note, "warn"))
+        return H, f"{how} (점수 {score:.2f})"
+
+    # ----------------------------------------------------- 3단계 · 기여도
+    def _analyze(self, csv_path: Path, cfg, out_dir: Path, H, calib_note) -> bool:
+        self.q.put(("log", "  3 / 3  기여도를 계산하는 중", "head"))
+        self.q.put(("stage", "기여도", 0, 1))
         try:
             tee = open(out_dir / "log.txt", "w", encoding="utf-8")
         except OSError:
@@ -662,14 +597,15 @@ class App:
         ok = False
         try:
             eng = load_engine()
-            self._apply(eng, cfg, csv_path, out_dir)
+            self._apply(eng, cfg, csv_path, out_dir, H)
+            print(f"  경기장 보정: {calib_note}")
             eng.main()
             self.q.put(("log", f"  -> {out_dir}", "ok"))
             ok = True
         except SystemExit as exc:
             writer.flush()
             self.q.put(("log", f"  멈춤: {exc}", "warn"))
-        except Exception as exc:                          # noqa: BLE001
+        except Exception as exc:                              # noqa: BLE001
             writer.flush()
             if type(exc).__name__ == "Stopped":
                 self.q.put(("log", "  중지했습니다.", "warn"))
@@ -684,34 +620,21 @@ class App:
                 tee.close()
         return ok
 
-    def _apply(self, eng, cfg, path, out_dir):
-        """창에서 정한 값을 엔진 전역에 꽂는다."""
+    def _apply(self, eng, cfg, path, out_dir, H):
         eng.EXCEL_PATH = str(path)
         eng.SAVE_XLSX = str(out_dir / "ipi_result.xlsx")
         eng.SAVE_PLOT = str(out_dir / "ipi_plot.png")
         eng.PITCH_L, eng.PITCH_W = float(cfg["pitch_l"]), float(cfg["pitch_w"])
-        eng.apply_pitch_scale()                 # 수식 19 를 새 크기로 다시 적용
-        eng.TEAM_SIZE = int(cfg["team_size"])
-        if str(cfg["fps"]).strip():
-            try:
-                eng.FPS = float(cfg["fps"])
-            except ValueError:
-                pass
+        eng.apply_pitch_scale()
+        eng.TEAM_SIZE = int(cfg["team_size"]) or 11
         eng.NORM_METHOD = cfg["norm"]
         eng.EXCLUDE_GK = bool(cfg["exclude_gk"])
         eng.POS_ADJUST = bool(cfg["pos_adjust"])
         eng.PA_LEARN = bool(cfg["pa_learn"])
-        eng.DROP_REFEREE = bool(cfg["drop_referee"])
         eng.SPEC_PR_PV_PROXIMITY = bool(cfg["spec_pv_prox"])
         eng.SPEC_PA_PROG_GOALDIST = bool(cfg["spec_prog_goaldist"])
-        if cfg.get("team_a") and cfg.get("team_b"):
-            eng.TEAM_NAMES = {"0": cfg["team_a"], "1": cfg["team_b"],
-                              cfg["team_a"]: cfg["team_a"], cfg["team_b"]: cfg["team_b"]}
-        if cfg.get("homography_src") and cfg.get("homography_dst"):
-            eng.HOMOGRAPHY_SRC = [tuple(p) for p in cfg["homography_src"]]
-            eng.HOMOGRAPHY_DST = [tuple(p) for p in cfg["homography_dst"]]
-        if not cfg["save_plot"]:
-            eng.plot = lambda *a, **k: None
+        if H is not None:
+            eng.HOMOGRAPHY_H = H
         eng.PROGRESS_CB = lambda stage, cur, total: self.q.put(("stage", stage, cur, total))
         eng.STOP_CB = self.stop_flag.is_set
 
@@ -728,7 +651,7 @@ class App:
                     if total > 1:
                         pct = min(100, cur * 100 / total)
                         self.progress.configure(value=pct)
-                        self.status.configure(text=f"{stage}  {cur:,} / {total:,}  ({pct:.0f}%)")
+                        self.status.configure(text=f"{stage}   {cur:,} / {total:,}  ({pct:.0f}%)")
                     else:
                         self.status.configure(text=f"{stage} ...")
                 elif kind == "done":
@@ -738,19 +661,16 @@ class App:
         self.root.after(100, self._drain)
 
     def _finished(self, done, total):
-        gone = {p.name for p in self.pending}
         if done:
-            for i in range(self.listbox.size() - 1, -1, -1):
-                self.listbox.delete(i)
+            self.listbox.delete(0, "end")
             self.pending.clear()
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         self.progress.configure(value=100 if done else 0)
-        self.status.configure(text=f"완료 — {done}/{total}개 분석됨" if done else "대기 중")
+        self.status.configure(text=f"완료 — {done}/{total}개" if done else "대기 중")
         self.log(f"── 끝났습니다 ({done}/{total}개) ──", "head" if done else "warn")
         if done:
-            self.log(f"   결과: {self.cfg['results_dir']}  "
-                     f"(ipi_result.xlsx · ipi_plot.png · log.txt)", "ok")
+            self.log(f"   결과: {self.cfg['results_dir']}", "ok")
 
     # ------------------------------------------------------------- 잡다
     def log(self, msg, tag=None):
@@ -785,8 +705,15 @@ class App:
         self.root.destroy()
 
 
+def _have(mod: str) -> bool:
+    import importlib.util
+    try:
+        return importlib.util.find_spec(mod) is not None
+    except (ImportError, ValueError):
+        return False
+
+
 def _attach_streams():
-    """pythonw.exe 로 띄우면 stdout 이 None 이라 print 가 터진다. 파일로 돌려놓는다."""
     if sys.stdout is not None and sys.stderr is not None:
         return
     LOGS_DIR.mkdir(parents=True, exist_ok=True)

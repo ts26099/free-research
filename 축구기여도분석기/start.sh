@@ -13,7 +13,8 @@ info() { printf '\033[36m%s\033[0m\n' "$*"; }
 warn() { printf '\033[33m%s\033[0m\n' "$*"; }
 fail() { printf '\033[31m%s\033[0m\n' "$*"; }
 
-need="numpy pandas scipy openpyxl matplotlib"
+need="numpy pandas scipy openpyxl matplotlib opencv-python"
+need_yolo="torch torchvision ultralytics lap"
 
 find_python() {
     for c in python3.12 python3.11 python3.10 python3 python; do
@@ -24,7 +25,7 @@ find_python() {
     return 1
 }
 
-ready() { "$1" -c 'import pandas, scipy, numpy, openpyxl' >/dev/null 2>&1; }
+ready() { "$1" -c 'import pandas, scipy, numpy, openpyxl, cv2' >/dev/null 2>&1; }
 
 PY=""
 for v in ./venv/bin/python ../venv/bin/python ../SoccerTracker/venv/bin/python; do
@@ -44,7 +45,9 @@ if [ -z "$PY" ]; then
         "$sys" -m venv venv || { fail "가상환경 생성 실패"; exit 1; }
         ./venv/bin/python -m pip install --upgrade pip --quiet
         ./venv/bin/python -m pip install $need || { fail "설치 실패"; exit 1; }
-        ./venv/bin/python -m pip install opencv-python tkinterdnd2 scikit-learn >/dev/null 2>&1
+        info "영상 분석용 PyTorch 와 YOLO 를 설치합니다 (2GB 가까이 받습니다)."
+        ./venv/bin/python -m pip install $need_yolo || warn "  YOLO 설치 실패 — 좌표 파일만 쓸 수 있습니다"
+        ./venv/bin/python -m pip install tkinterdnd2 scikit-learn openvino onnx >/dev/null 2>&1
         PY="./venv/bin/python"
         info "설치 완료."
     fi

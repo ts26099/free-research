@@ -63,6 +63,8 @@ SHEET_BALL   = None      # 공 좌표가 따로 있는 시트. 없으면 None (�
 #     HOMOGRAPHY_DST = [(0, 0), (105, 0), (105, 68), (0, 68)]
 HOMOGRAPHY_SRC = None    # None 이면 변환하지 않는다 (이미 미터 좌표인 입력)
 HOMOGRAPHY_DST = None
+HOMOGRAPHY_H = None      # 3x3 행렬을 직접 줄 수도 있다 (자동 보정이 이쪽으로 준다).
+                         #   기준점 네 쌍 대신 이미 구한 변환을 그대로 쓴다.
 PLAYER_POINT = "foot"    # 선수 대표점 (수식 9). "foot" = 발밑 중앙 (fx,fy)
                          #   "center" = 박스 중심. 호모그래피는 지면 평면 변환이라
                          #   공중에 뜬 점(배꼽)을 넣으면 좌표가 뒤로 밀린다.
@@ -664,7 +666,10 @@ def read_data():
     #  문서 §7 한계 1 이 "호모그래피를 아직 안 썼다"이고 §8 할 일 1순위가 이것이다.
     #  카메라가 비스듬히 찍으면 화면 어디냐에 따라 거리 오차가 14~46% 난다.
     #  SC 와 PR 이 둘 다 거리 기반이라 그 오차가 지표 전체로 번진다.
-    if HOMOGRAPHY_SRC and HOMOGRAPHY_DST:
+    H = None
+    if HOMOGRAPHY_H is not None:
+        H = np.asarray(HOMOGRAPHY_H, float).reshape(3, 3)
+    elif HOMOGRAPHY_SRC and HOMOGRAPHY_DST:
         H = solve_homography(HOMOGRAPHY_SRC, HOMOGRAPHY_DST)
         # 되돌림 오차 — 기준점을 변환해 실제 위치와 비교한다. 네 점이 한 직선에
         # 가깝게 몰려 있으면 식은 풀려도 엉뚱한 변환이 나오는데 여기서 드러난다.
@@ -677,6 +682,7 @@ def read_data():
         if _e > 1.0:
             print(f"  ! 기준점이 잘 안 맞는다. 네 점이 한 직선에 가깝거나 클릭 위치가 "
                   f"실제 지점과 다를 수 있다. 보정을 다시 하는 편이 낫다.")
+    if H is not None:
         bx0, by0 = tracks["X"].median(), tracks["Y"].median()
         tracks["X"], tracks["Y"] = apply_homography(H, tracks["X"], tracks["Y"])
         if {"ball_x", "ball_y"} <= set(tracks.columns):   # 공이 별도 열로 온 경우
@@ -1091,11 +1097,22 @@ def ball_plausibility(ball):
         bad |= (v > BALL_SPEED_MAX).fillna(False)
 
     if BALL_FROZEN_M > 0 and BALL_FROZEN_S > 0:
-        # '거의 안 움직인' 구간을 이어 붙여 길이를 잰다
-        still = (step <= BALL_FROZEN_M).fillna(False)
-        grp = (~still).cumsum()
-        span = b.frame.groupby(grp).transform(lambda f: f.max() - f.min())
-        bad |= still & (span >= BALL_FROZEN_S * FPS)
+        # 얼어붙었는지는 '한 프레임 사이에 얼마나 움직였나'로 보면 안 된다.
+        #   25 fps 에서 2 m/s 로 굴러가는 공은 한 프레임에 0.08 m 만 움직인다.
+        #   그걸 '거의 안 움직였다'로 세면 드리블이 2초만 이어져도 공 전체가
+        #   가짜로 찍힌다(실측: 600프레임 중 599프레임이 버려졌다).
+        #   그래서 '그 시간 창 안에서 얼마나 옮겨 갔나'를 본다.
+        win = max(2, int(round(BALL_FROZEN_S * FPS)))
+        full = pd.RangeIndex(int(b.frame.min()), int(b.frame.max()) + 1)
+        gx = b.set_index("frame")["ball_x"].reindex(full).interpolate(limit_area="inside")
+        gy = b.set_index("frame")["ball_y"].reindex(full).interpolate(limit_area="inside")
+        # 창을 가운데에 두고 본다. 뒤로만 보면 '멈춘 지 2초가 지난 뒤부터' 걸려서
+        # 멈춰 있던 앞부분이 그대로 남는다.
+        roll = dict(window=win, center=True, min_periods=max(2, win // 2))
+        rng = ((gx.rolling(**roll).max() - gx.rolling(**roll).min())
+               .combine((gy.rolling(**roll).max() - gy.rolling(**roll).min()), max))
+        frozen = (rng <= BALL_FROZEN_M).reindex(b.frame).fillna(False).to_numpy()
+        bad |= pd.Series(frozen, index=b.index)
 
     b["ball_bad"] = bad
     return b
