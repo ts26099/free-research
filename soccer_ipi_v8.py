@@ -1690,6 +1690,18 @@ def detect_goalkeepers(dist_goal, tracks, teams):
     return gks
 
 
+def _ids(xs):
+    """선수 id 목록을 사람이 읽을 수 있게. numpy 정수가 그대로 찍히는 것을 막는다."""
+    out = []
+    for x in xs:
+        try:
+            out.append(str(int(x)))
+        except (TypeError, ValueError):
+            out.append(str(x))
+    out = sorted(out)
+    return ", ".join(out[:12]) + (f" 외 {len(out) - 12}명" if len(out) > 12 else "")
+
+
 def player_type(def_z, off_z):
     """
     문서 §6.4 — IPI 하나만 보여주면 안 되고 DEF_z–OFF_z 평면 위의 위치를
@@ -1786,13 +1798,13 @@ def integrate_scores(agg, tracks, teams):
           f"{W_DEF}·DEF_z + {W_OFF}·OFF_z)   n() = {NORM_METHOD} 정규화")
     if gks:
         tag = "순위에서 제외" if EXCLUDE_GK else "표시만 하고 포함"
-        print(f"           골키퍼 {sorted(gks)} — {tag} "
+        print(f"           골키퍼 {_ids(gks)} — {tag} "
               f"(자기 골대까지 평균 {dist_goal[list(gks)].mean():.1f} m)")
         if len(gks) < 2:
             print(f"           ! 골키퍼를 {len(gks)}명만 찾았다 (팀당 한 명이어야 한다). "
                   f"GK_MAX_DIST 를 늘리거나 GK_IDS 로 직접 지정할 것.")
     if thin.any():
-        print(f"           표본 부족으로 제외: {list(a.index[thin])}")
+        print(f"           표본 부족으로 제외: {_ids(a.index[thin])}")
 
     # 신뢰도가 실제로 얼마나 당겼는지 — 문서 §3.5 의 취지가 보이게 남긴다
     m_rho = a["rho"][use & a["PA_mean"].notna()]
