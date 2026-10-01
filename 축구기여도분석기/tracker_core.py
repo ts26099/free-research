@@ -1692,6 +1692,17 @@ def parse_time(text: str) -> float:
     return sec
 
 
+def _howlong(sec: float) -> str:
+    """사람이 읽는 소요 시간. _clock 은 '563m07s' 라 한눈에 안 들어온다."""
+    sec = max(0.0, float(sec))
+    if sec < 90:
+        return f"{sec:.0f}초"
+    if sec < 5400:
+        return f"{sec/60:.0f}분"
+    h, m = divmod(int(sec // 60), 60)
+    return f"{h}시간 {m}분"
+
+
 def _clock(sec: float | None) -> str:
     """초를 '12m30s' 같은 폴더 이름용 문자열로. 파일명에 콜론을 못 쓴다."""
     if sec is None:
@@ -1869,6 +1880,11 @@ def analyze(
     ball_still = 0       # 멈춰 있어서 밝기 면제를 못 받은 후보 수 (페널티 마크 등)
     ball_focus_calls = 0 # 주시 확대를 돌린 횟수
     ball_full_calls = 0  # 전체화면 공 패스를 돌린 횟수
+    # 어디서 시간을 쓰는지 — 느릴 때 추측하지 않으려고 센다.
+    # 한 번은 '빠르게 만든다'고 고친 판이 14배 느려졌는데, 어느 단계가
+    # 느려진 건지 알 길이 없어 원인을 못 찾았다. 그 일이 없도록 남긴다.
+    spent = {"읽기": 0.0, "사람검출": 0.0, "공전체": 0.0, "공확대": 0.0,
+             "잔디마스크": 0.0, "나머지": 0.0}
     ball_from_focus = 0  # 확대 창에서 찾아 최종 공이 된 프레임 수
     # 원본 프레임 -> 그 프레임에서 공 모델이 본 후보 자리들 (멈춤 판정용)
     ball_hist: dict[int, list] = {}
@@ -1981,10 +1997,16 @@ def analyze(
                             break
                         idx += 1
                         continue
+                    t0 = time.time()
                     okay, img = cap.read()
                     if not okay:
                         break
-                    yield idx, model.track(img, persist=True, **common)[0]
+                    t1 = time.time()
+                    res = model.track(img, persist=True, **common)[0]
+                    t2 = time.time()
+                    spent["읽기"] += t1 - t0
+                    spent["사람검출"] += t2 - t1
+                    yield idx, res
                     idx += 1
             finally:
                 cap.release()
@@ -1999,10 +2021,12 @@ def analyze(
             frame_img = getattr(result, "orig_img", None)
             if pitch_on and frame_idx % pitch_every == 0:
                 if frame_img is not None:
+                    _t = time.time()
                     try:
                         new_mask = pitch_mask(frame_img, cfg)
                     except Exception:  # noqa: BLE001 — 마스크 실패가 분석을 멈추면 안 된다
                         new_mask = None
+                    spent["잔디마스크"] += time.time() - _t
                     # 못 찾은 프레임(리플레이·클로즈업)에서는 직전 마스크를 유지한다
                     if new_mask is not None:
                         mask = new_mask
@@ -2149,6 +2173,7 @@ def analyze(
                 bres = None
                 if do_full:
                     ball_full_calls += 1
+                    _t = time.time()
                     try:
                         bres = ball_model.predict(frame_img, imgsz=int(cfg.ball_imgsz),
                                                   conf=float(cfg.ball_conf),
@@ -2158,6 +2183,7 @@ def analyze(
                             log(f"  공 모델 추론 실패 (이후 생략): {exc}")
                         ball_errors += 1
                         bres = None
+                    spent["공전체"] += time.time() - _t
                 cands = []
                 seen_now: list[tuple[float, float]] = []
                 raw_now: list[tuple] = []
@@ -2230,6 +2256,7 @@ def analyze(
                     py_ = ball_picker.last[1] + ball_picker.vel[1] * steps
                     fx0 = int(min(max(px_ - S_ / 2, 0), W_ - S_))
                     fy0 = int(min(max(py_ - S_ / 2, 0), H_ - S_))
+                    _t = time.time()
                     try:
                         fres = ball_model.predict(
                             frame_img[fy0:fy0 + S_, fx0:fx0 + S_],
@@ -2237,6 +2264,7 @@ def analyze(
                             conf=float(cfg.ball_conf), verbose=False)[0]
                     except Exception:  # noqa: BLE001 — 확대 실패는 넘어간다
                         fres = None
+                    spent["공확대"] += time.time() - _t
                     ball_focus_calls += 1
                     if fres is not None and fres.boxes is not None:
                         for bb in fres.boxes:
@@ -2306,11 +2334,27 @@ def analyze(
                 if todo and frames_seen > 5 and elapsed > 0:
                     eta = (todo - frames_seen) * elapsed / frames_seen
                 on_progress(frames_seen, todo, eta)
+            # 40장쯤 돌아 보면 전체가 얼마나 걸릴지 알 수 있다. 끝나고 나서
+            # 알려 주면 늦다 — 실측에서 한 번 9시간 23분을 기다리고 나서야
+            # 느리다는 걸 알았다. 오래 걸릴 것 같으면 지금 말해 준다.
+            if frames_seen == 40 and todo:
+                elapsed = time.time() - started
+                if elapsed > 0:
+                    eta = (todo - frames_seen) * elapsed / frames_seen
+                    log(f"  지금 속도로 {frames_seen/elapsed:.2f}장/초 — "
+                        f"다 하는 데 {_howlong(eta)} 쯤 걸립니다")
+                    if eta > 3600:
+                        log(f"  ! 한 시간이 넘습니다. [중지] 하고 [고급 설정] 에서 "
+                            f"'분석 속도'를 '빠르게'로 두거나 '구간'으로 몇 분만 "
+                            f"잘라 보는 편이 낫습니다.")
             if frames_seen % 300 == 0:
                 fh.flush()   # 도중에 끊겨도 여기까지는 남는다
                 elapsed = time.time() - started
                 speed = frames_seen / elapsed if elapsed else 0
-                log(f"  {frames_seen}/{todo or '?'}장 · {written:,}행 · {speed:.1f}장/초")
+                top = max(spent, key=spent.get)
+                log(f"  {frames_seen}/{todo or '?'}장 · {written:,}행 · "
+                    f"{speed:.2f}장/초 · 시간을 제일 많이 쓰는 곳: {top} "
+                    f"({spent[top]/elapsed*100:.0f}%)")
 
     if frames_seen == 0:
         # 여기까지 왔는데 한 장도 못 읽었다면 결과를 남길 이유가 없다.
@@ -2392,6 +2436,9 @@ def analyze(
         "unique_track_ids": len(ids_seen),
         "class_counts": class_counts,
         "elapsed_sec": round(elapsed, 1),
+        "time_spent_sec": {k: round(v, 1) for k, v in spent.items()},
+        "time_spent_pct": {k: (round(v / elapsed * 100, 1) if elapsed else 0)
+                           for k, v in spent.items()},
         "processed_fps": round(frames_seen / elapsed, 2) if elapsed else 0,
         "config": asdict(cfg),
         "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -2443,6 +2490,12 @@ def analyze(
         if share > 0.9:
             log(f"  ! 공 후보 대부분이 밝기 {bright_floor} 미만입니다. 이 영상의 조명이"
                 f" 어두우면 config.json 의 ball_min_bright 를 낮추거나 0 으로 끄세요.")
+    if elapsed > 0:
+        spent["나머지"] = max(0.0, elapsed - sum(v for k, v in spent.items()
+                                               if k != "나머지"))
+        parts = sorted(spent.items(), key=lambda kv: -kv[1])
+        log("  시간을 어디에 썼나: " + " · ".join(
+            f"{k} {v/elapsed*100:.0f}%" for k, v in parts if v > 0.005 * elapsed))
     if ball_focus_calls:
         log(f"  주시 확대 {ball_focus_calls:,}번 · 그중 확대 창에서 찾은 공 {ball_from_focus:,}장")
         if int(cfg.ball_full_every) > 0:

@@ -254,25 +254,18 @@ def load_core():
     return tracker_core
 
 
-def cpu_threads(log=print) -> None:
-    """CPU 로 돌 때 torch 가 코어를 다 쓰도록 해 둔다."""
-    try:
-        import torch
-    except ImportError:
-        return
-    if has_gpu():
-        return
-    try:
-        n = len(os.sched_getaffinity(0))          # 리눅스
-    except AttributeError:
-        n = os.cpu_count() or 1                   # 윈도우·mac
-    try:
-        if torch.get_num_threads() < n:
-            torch.set_num_threads(n)
-        torch.set_flush_denormal(True)
-    except Exception:                             # noqa: BLE001
-        return
-    log(f"  CPU {n}코어로 돌립니다 (torch 스레드 {torch.get_num_threads()})")
+# torch 스레드 수를 직접 건드리던 코드가 여기 있었다 — 뺐다.
+#
+# os.cpu_count() 만큼 스레드를 쓰게 했는데, 그 판을 돌린 실측에서 분석이
+# 2,447초 -> 33,787초(9시간 23분)로 느려졌다. 같은 판에서 순수 numpy 로만
+# 도는 SC 단계도 10.0 -> 15.4 ms/프레임이 됐다 — 모델과 상관없는 단계까지
+# 느려졌다는 건 스레드 풀이 서로 밟고 있었다는 뜻이다. 윈도우 8코어
+# 기계에서 torch 가 스스로 고른 값은 7이었는데 거기에 8을 밀어 넣었다.
+# (P코어·E코어가 섞인 CPU 에서 OpenMP 가 과하게 돌면 선형보다 훨씬 나쁘게
+# 무너진다.)
+#
+# 재 보지 않고 넣은 '최적화'였고, 재 보니 틀렸다. torch 가 고르는 값을
+# 그대로 둔다.
 
 
 def make_config(core, model, ball_model, imgsz, stride, save_video, ball_full_every=6):
@@ -308,7 +301,6 @@ def track(video: Path, out_root: Path, log, on_progress, should_stop,
     core = load_core()
     imgsz, stride, every, why = auto_quality(speed)
     log(f"  {how} · {why}")
-    cpu_threads(log)
     cfg = make_config(core, model, ball_model, imgsz, stride, save_video, every)
     out_root.mkdir(parents=True, exist_ok=True)
     done = core.run_batch([video], out_root, cfg, log=log, on_progress=on_progress,
