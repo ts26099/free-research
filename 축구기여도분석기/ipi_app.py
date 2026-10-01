@@ -64,7 +64,7 @@ DEFAULTS = {
     "pitch_l": 105.0, "pitch_w": 68.0, "team_size": 0,     # 0 = 자동
     "from_sec": "", "to_sec": "", "save_video": False,
     "speed": "auto", "stitch": True,
-    "force_calib": False, "reuse_tracks": True,
+    "force_calib": False, "reuse_tracks": True, "roster": True,
     "norm": "z", "exclude_gk": True, "pos_adjust": True, "pa_learn": True,
     "spec_pv_prox": False, "spec_prog_goaldist": False,
     "manual_src": None, "manual_dst": None,                # 손으로 보정했을 때만
@@ -329,6 +329,9 @@ class App:
         a16.pack(fill="x", pady=2)
         self.force_var = tk.BooleanVar(value=self.cfg.get("force_calib", False))
         self.reuse_var = tk.BooleanVar(value=self.cfg.get("reuse_tracks", True))
+        self.roster_var = tk.BooleanVar(value=self.cfg.get("roster", True))
+        ttk.Checkbutton(a16, text="명단 맞추기 (정원만큼만)",
+                        variable=self.roster_var).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(a16, text="보정이 의심스러워도 계산",
                         variable=self.force_var).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(a16, text="좌표 다시 뽑기 (이미 있어도)",
@@ -510,6 +513,7 @@ class App:
             "speed": SPEED_KEY.get(self.speed_var.get(), "auto"),
             "stitch": self.stitch_var.get(),
             "force_calib": self.force_var.get(),
+            "roster": self.roster_var.get(),
             "reuse_tracks": self.reuse_var.get(),
         })
         save_config(self.cfg)
@@ -742,7 +746,8 @@ class App:
         try:
             new_path, rep = stitch.stitch(
                 csv_path, H, float(cfg["pitch_l"]), float(cfg["pitch_w"]),
-                log=lambda m: self.q.put(("log", "  " + str(m))))
+                log=lambda m: self.q.put(("log", "  " + str(m))),
+                team_size=int(cfg["team_size"]) if cfg.get("roster", True) else 0)
         except Exception as exc:                              # noqa: BLE001
             self.q.put(("log", f"  손질을 건너뜁니다 ({type(exc).__name__}: {exc})", "warn"))
             return csv_path

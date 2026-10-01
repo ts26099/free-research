@@ -63,6 +63,8 @@ SHEET_BALL   = None      # 공 좌표가 따로 있는 시트. 없으면 None (�
 #     HOMOGRAPHY_DST = [(0, 0), (105, 0), (105, 68), (0, 68)]
 HOMOGRAPHY_SRC = None    # None 이면 변환하지 않는다 (이미 미터 좌표인 입력)
 HOMOGRAPHY_DST = None
+HOMOGRAPHY_H = None      # 3x3 행렬을 직접 줄 수도 있다 (자동 보정이 이쪽으로 준다).
+                         #   기준점 네 쌍 대신 이미 구한 변환을 그대로 쓴다.
 PLAYER_POINT = "foot"    # 선수 대표점 (수식 9). "foot" = 발밑 중앙 (fx,fy)
                          #   "center" = 박스 중심. 호모그래피는 지면 평면 변환이라
                          #   공중에 뜬 점(배꼽)을 넣으면 좌표가 뒤로 밀린다.
@@ -664,7 +666,10 @@ def read_data():
     #  문서 §7 한계 1 이 "호모그래피를 아직 안 썼다"이고 §8 할 일 1순위가 이것이다.
     #  카메라가 비스듬히 찍으면 화면 어디냐에 따라 거리 오차가 14~46% 난다.
     #  SC 와 PR 이 둘 다 거리 기반이라 그 오차가 지표 전체로 번진다.
-    if HOMOGRAPHY_SRC and HOMOGRAPHY_DST:
+    H = None
+    if HOMOGRAPHY_H is not None:
+        H = np.asarray(HOMOGRAPHY_H, float).reshape(3, 3)
+    elif HOMOGRAPHY_SRC and HOMOGRAPHY_DST:
         H = solve_homography(HOMOGRAPHY_SRC, HOMOGRAPHY_DST)
         # 되돌림 오차 — 기준점을 변환해 실제 위치와 비교한다. 네 점이 한 직선에
         # 가깝게 몰려 있으면 식은 풀려도 엉뚱한 변환이 나오는데 여기서 드러난다.
@@ -677,6 +682,11 @@ def read_data():
         if _e > 1.0:
             print(f"  ! 기준점이 잘 안 맞는다. 네 점이 한 직선에 가깝거나 클릭 위치가 "
                   f"실제 지점과 다를 수 있다. 보정을 다시 하는 편이 낫다.")
+    # 변환을 실제로 적용하는 곳. 어느 경로로 H 를 얻었든 여기를 지나야 한다.
+    # (기준점 네 쌍으로 구한 경우 안쪽에 들어가 있어서, 자동 보정이 준
+    #  행렬로는 변환이 통째로 건너뛰어진 적이 있다 — 좌표가 픽셀 그대로
+    #  남아 분석이 멈췄다.)
+    if H is not None:
         bx0, by0 = tracks["X"].median(), tracks["Y"].median()
         tracks["X"], tracks["Y"] = apply_homography(H, tracks["X"], tracks["Y"])
         if {"ball_x", "ball_y"} <= set(tracks.columns):   # 공이 별도 열로 온 경우

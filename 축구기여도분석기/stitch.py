@@ -53,6 +53,21 @@ STATIC_M = 2.0         # 이만큼도 안 움직였으면 관중·그래픽이�
 MIN_LIFE_SEC = 1.0     # 다 이어붙인 뒤에도 이보다 짧으면 사람으로 안 본다
 MIN_SAMPLES = 8        # 그리고 표본이 이보다 적으면 (둘 다일 때만 버린다)
 
+# --- 명단 맞추기 ---------------------------------------------------------
+# 경기에 뛰는 사람 수는 정해져 있다. 7v7 이면 14명, 11v11 이면 22명이다.
+# 그런데 추적기는 번호를 마음대로 새로 딴다 — 실측에서 22명 경기에 281개가
+# 나왔고, 이어붙이기로 101개까지 줄였지만 그래도 선수 수의 다섯 배다.
+#
+# 다른 접근이 있다. 번호를 '발급' 하지 말고 '정해 놓고 배정' 하는 것이다.
+# 팀마다 칸을 정원만큼 만들어 두고, 토막들을 그 칸에 채워 넣는다. 칸이
+# 모자라면 더 만들지 않고 남는 토막을 버린다. 그러면 결과는 반드시 정원이다.
+#
+# 단, 이게 성립하려면 '모든 선수가 화면에 보여야' 한다. 카메라가 따라다니며
+# 일부만 비추면, 화면 밖에 있던 선수의 토막을 엉뚱한 칸에 밀어 넣게 된다.
+# 그래서 프레임당 인원이 정원에 가까울 때만 켠다.
+ROSTER_GAP_SEC = 10.0  # 칸을 채울 때는 이 정도 공백까지 건너뛴다
+ROSTER_NEED = 0.85     # 프레임당 인원이 정원의 이만큼은 돼야 명단을 맞춘다
+
 
 def apply_h(H, x, y):
     """픽셀 (x, y) 를 호모그래피로 미터 좌표에 옮긴다."""
@@ -186,8 +201,86 @@ def _link(tracks, pairs):
     return head
 
 
+def _chains(tracks, remap):
+    """체인(이어붙인 한 묶음)별로 시간순 멤버와 양 끝 상태를 모은다."""
+    byroot = {}
+    for tid, root in remap.items():
+        byroot.setdefault(root, []).append(tracks[tid])
+    out = {}
+    for root, members in byroot.items():
+        members.sort(key=lambda t: t.t0)
+        out[root] = {
+            "members": members,
+            "t0": members[0].t0, "t1": members[-1].t1,
+            "p0": members[0].p0, "p1": members[-1].p1,
+            "vel": members[-1].vel,
+            "n": sum(m.n for m in members),
+            "team": next((m.team for m in members if m.team), None),
+        }
+    return out
+
+
+def _roster(chains, team_size, log):
+    """
+    팀마다 정원만큼 칸을 만들고 체인을 채워 넣는다.
+
+    긴 체인부터 칸의 주인이 되고, 나머지는 시간이 겹치지 않고 위치가 닿는
+    칸에 들어간다. 못 들어가면 버린다 — 칸을 늘리지 않는 것이 핵심이다.
+
+    돌려주는 것: {체인 루트 -> 칸 번호}, 못 넣은 체인 목록
+    """
+    assign, dropped = {}, []
+    teams = sorted({c["team"] for c in chains.values() if c["team"]})
+    letter = {t: chr(ord("A") + i) for i, t in enumerate(teams)}
+    for team in teams:
+        mine = {r: c for r, c in chains.items() if c["team"] == team}
+        order = sorted(mine, key=lambda r: -mine[r]["n"])
+        slots = []                      # 칸마다 [채워 넣은 체인들] (시간순)
+        for root in order:
+            c = mine[root]
+            if len(slots) < team_size:
+                slots.append([root])
+                assign[root] = (letter[team], len(slots) - 1)
+                continue
+            best, best_cost = None, None
+            for k, slot in enumerate(slots):
+                # 시간이 겹치면 같은 사람일 수 없다
+                if any(not (c["t1"] < chains[o]["t0"] or c["t0"] > chains[o]["t1"])
+                       for o in slot):
+                    continue
+                # 바로 앞/뒤 체인과 이어 붙일 수 있는가
+                before = [o for o in slot if chains[o]["t1"] < c["t0"]]
+                after = [o for o in slot if chains[o]["t0"] > c["t1"]]
+                cost = None
+                if before:
+                    a = chains[max(before, key=lambda o: chains[o]["t1"])]
+                    gap = c["t0"] - a["t1"]
+                    if gap <= ROSTER_GAP_SEC:
+                        px = a["p1"][0] + a["vel"][0] * min(gap, 1.0)
+                        py = a["p1"][1] + a["vel"][1] * min(gap, 1.0)
+                        d = math.hypot(c["p0"][0] - px, c["p0"][1] - py)
+                        if d <= SPEED_MAX * gap + SLACK_M:
+                            cost = d / max(SPEED_MAX * gap + SLACK_M, 1e-6)
+                if cost is None and after:
+                    b = chains[min(after, key=lambda o: chains[o]["t0"])]
+                    gap = b["t0"] - c["t1"]
+                    if gap <= ROSTER_GAP_SEC:
+                        d = math.hypot(b["p0"][0] - c["p1"][0],
+                                       b["p0"][1] - c["p1"][1])
+                        if d <= SPEED_MAX * gap + SLACK_M:
+                            cost = d / max(SPEED_MAX * gap + SLACK_M, 1e-6)
+                if cost is not None and (best_cost is None or cost < best_cost):
+                    best, best_cost = k, cost
+            if best is None:
+                dropped.append(root)
+            else:
+                slots[best].append(root)
+                assign[root] = (letter[team], best)
+    return assign, dropped
+
+
 def stitch(csv_path, H, pitch_l=105.0, pitch_w=68.0, log=print,
-           out_path=None) -> tuple[Path, dict]:
+           out_path=None, team_size=0) -> tuple[Path, dict]:
     """
     tracks.csv 를 손질해 tracks_stitched.csv 를 쓴다.
     (새 파일 경로, 보고서) 를 돌려준다. 손질할 게 없으면 원본 경로를 준다.
@@ -196,7 +289,7 @@ def stitch(csv_path, H, pitch_l=105.0, pitch_w=68.0, log=print,
     df = pd.read_csv(csv_path)
     report = {"before": 0, "after": 0, "dropped_outside": 0,
               "dropped_static": 0, "dropped_short": 0, "merged": 0,
-              "rows_dropped": 0}
+              "rows_dropped": 0, "roster": 0, "dropped_roster": 0}
     if "track_id" not in df.columns or not len(df):
         return csv_path, report
 
@@ -266,13 +359,55 @@ def stitch(csv_path, H, pitch_l=105.0, pitch_w=68.0, log=print,
     report["dropped_short"] = len(junk_short)
     report["after"] = merged_to - len(short)
 
+    # --- 명단 맞추기 (선택) ------------------------------------------
+    # 화면에 전원이 보이는 영상에서만 켠다. 카메라가 일부만 비추면
+    # 화면 밖에 있던 선수의 토막을 엉뚱한 칸에 밀어 넣게 된다.
+    if team_size and report["after"] > 2 * int(team_size):
+        live = float(people.groupby("frame").size().median())
+        need = ROSTER_NEED * 2 * int(team_size)
+        if live < need:
+            log(f"  명단 맞추기는 건너뜁니다 — 프레임당 인원 {live:.0f}명이 "
+                f"정원 {2*int(team_size)}명에 못 미칩니다 "
+                f"(카메라가 경기장 일부만 비추는 영상이다)")
+        else:
+            chains = {r: c for r, c in _chains(tracks, remap).items()
+                      if r not in short}
+            assign, roster_drop = _roster(chains, int(team_size), log)
+            if assign:
+                # 체인 루트 -> 'A1' / 'B3' 같은 칸 이름
+                name = {root: f"{team}{k + 1}" for root, (team, k) in assign.items()}
+                drop_roots = set(roster_drop)
+                junk_roster = [tid for tid, root in remap.items()
+                               if root in drop_roots]
+                remap = {tid: name.get(root, root)
+                         for tid, root in remap.items()
+                         if root not in drop_roots}
+                report["after"] = len(set(remap.values()))
+                report["roster"] = int(team_size)
+                report["dropped_roster"] = len(roster_drop)
+                junk_short = list(junk_short) + junk_roster
+                free = sorted(v for v in set(remap.values())
+                              if not str(v)[:1].isalpha())
+                log(f"  명단 맞추기: 팀마다 {team_size}칸을 두고 채워 "
+                    f"A1~A{team_size} · B1~B{team_size} 로 번호를 줬습니다 "
+                    f"(칸에 못 들어간 토막 {len(roster_drop)}개는 버림)")
+                if free:
+                    log(f"    팀이 안 붙은 토막 {len(free)}개는 명단 밖으로 "
+                        f"남겼습니다 (대개 골키퍼다 — 번호가 그대로다)")
+
     drop = set(junk_out) | set(junk_static) | set(junk_short)
+    # 명단 맞추기로 remap 에서 빠진 트랙도 버린다
+    drop |= {tid for tid in tracks if tid not in remap}
     keep = ~(df["track_id"].isin(drop) & ~is_ball)
     report["rows_dropped"] = int((~keep).sum())
     out = df[keep].copy()
-    out.loc[~is_ball[keep], "track_id"] = (
-        out.loc[~is_ball[keep], "track_id"].map(remap).fillna(
-            out.loc[~is_ball[keep], "track_id"]).astype(int))
+    # 명단을 맞추면 track_id 가 'A1' 같은 글자가 된다. 숫자 열에 글자를
+    # 넣을 수 없으므로 열 자체를 글자로 올린 뒤에 바꾼다.
+    m = (~is_ball[keep]).to_numpy()
+    new_ids = out.loc[m, "track_id"].map(remap).fillna(out.loc[m, "track_id"])
+    if new_ids.map(lambda v: isinstance(v, str)).any():
+        out["track_id"] = out["track_id"].astype(object)
+    out.loc[m, "track_id"] = new_ids
 
     out_path = Path(out_path) if out_path else csv_path.with_name("tracks_stitched.csv")
     out.to_csv(out_path, index=False, encoding="utf-8-sig")
