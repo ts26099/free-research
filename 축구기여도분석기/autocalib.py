@@ -196,6 +196,37 @@ def line_distance_map(lines, cv2):
     return cv2.distanceTransform((lines == 0).astype(np.uint8), cv2.DIST_L2, 3)
 
 
+def grass_inside(H, mask, pitch_l, pitch_w, margin=5.0, n=4000):
+    """
+    화면의 잔디가 '경기장 직사각형 안' 으로 옮겨지는 비율.
+
+    보정이 맞았는지 가리는 가장 센 단서다. 화면에 보이는 녹색은 거의 다
+    경기장이므로, 보정이 맞으면 그 점들이 105 x 68 안에 들어와야 한다.
+
+    경기장 선을 얼마나 덮었나(template_score)만 보면 속는다. 경기장을
+    화면 한쪽 띠로 뭉개 넣는 보정은 그 띠에 선 비슷한 것(광고판·관중석
+    가장자리·터치라인)이 많아 덮은 비율이 높게 나온다. 실제로 그렇게 해서
+    0.75 를 받은 보정이 경기장 전체를 오른쪽 관중석 쪽에 구겨 넣었다.
+    그런데 그러면 화면 대부분을 차지하는 잔디가 경기장 밖으로 밀려난다.
+    실측: 손으로 맞춘 보정 90% · 뭉개진 보정 39%.
+    """
+    if H is None or mask is None:
+        return 0.0
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 100:
+        return 0.0
+    if len(xs) > n:
+        k = np.linspace(0, len(xs) - 1, n).astype(int)
+        xs, ys = xs[k], ys[k]
+    X, Y = apply_h(H, xs.astype(float), ys.astype(float))
+    ok = np.isfinite(X) & np.isfinite(Y)
+    if ok.sum() < 50:
+        return 0.0
+    X, Y = X[ok], Y[ok]
+    return float(np.mean((X > -margin) & (X < pitch_l + margin)
+                         & (Y > -margin) & (Y < pitch_w + margin)))
+
+
 def sane_homography(H, shape, pitch_l, pitch_w):
     """
     화면 전체가 말이 되는 넓이의 경기장으로 옮겨지는가.
@@ -506,7 +537,7 @@ def find_by_lines(img, pitch_l, pitch_w, cv2, px=None, py=None):
     dsts = [np.float32([[0, 0], [pitch_l, 0], [pitch_l, pitch_w], [0, pitch_w]]),
             np.float32([[0, 0], [0, pitch_w], [pitch_l, pitch_w], [pitch_l, 0]])]
     min_gap_h, min_gap_v = h * 0.12, w * 0.12
-    best_H, best_s = None, 0.0
+    best_H, best_s, best_tpl, best_gin = None, 0.0, 0.0, 0.0
     for i in range(len(horiz)):
         for j in range(i + 1, len(horiz)):
             if abs(horiz[i][1] - horiz[j][1]) < min_gap_h:
@@ -525,17 +556,20 @@ def find_by_lines(img, pitch_l, pitch_w, cv2, px=None, py=None):
                         H = homography(quad, dst)
                         if H is None:
                             continue
+                        # 잔디가 경기장 안으로 들어오는가 — 이게 먼저다.
+                        # 여기서 떨어지면 나머지 점수가 아무리 높아도 버린다.
+                        gin = grass_inside(H, mask, pitch_l, pitch_w)
+                        if gin < GRASS_MIN:
+                            continue
                         base, _ = score_homography(H, px, py, pitch_l, pitch_w)
                         # 찾은 흰 선이 실제 경기장 선 모양과 맞는가.
-                        # 이것만이 '하프라인+페널티박스 선을 경기장 테두리로
-                        # 착각해 화면을 통째로 늘려 붙인' 경우를 걸러낸다.
                         tpl = template_score(H, dist_px, img.shape, pitch_l, pitch_w)
-                        s = 0.6 * tpl + 0.3 * base + 0.1 * inside_quad(quad, line_pts)
+                        s = 0.4 * tpl + 0.35 * gin + 0.25 * base
                         if s > best_s + 1e-6:
-                            best_H, best_s, best_tpl = H, s, tpl
+                            best_H, best_s, best_tpl, best_gin = H, s, tpl, gin
     if best_H is None:
         return None, 0.0, 0.0
-    return best_H, best_s, best_tpl
+    return best_H, best_s, min(best_tpl, best_gin)
 
 
 # ────────────────────────────────────────────── 2) 선수가 퍼진 범위로 찾기
@@ -596,7 +630,17 @@ def sample_frames(video, n=9, log=print):
 # 절반만 보이는 화면에서는 보이는 쪽만 맞춰 놓고도 높게 나온다 (실측:
 # 길이 방향이 1.9배 늘어난 보정이 0.75 를 받았다). 낮으면 확실히 틀렸다는
 # 것만 믿을 수 있다. 그래서 어느 쪽이든 calib_check.png 를 보게 한다.
+GRASS_MIN = 0.70       # 잔디의 이만큼은 경기장 안으로 들어와야 쓴다
 TPL_WEAK = 0.45        # 이 아래면 확실히 틀렸다
+TPL_TRUST = 0.80       # 이 위라야 '맞다고 보고 그냥 쓴다'
+#
+# TPL_TRUST 를 왜 이렇게 높게 뒀나.
+# 실측(골대 뒤 중계 화면)에서 손으로 네 점을 찍어 맞춘 보정 — 눈으로 보면
+# 빨간 선이 흰 선에 딱 얹히는 것 — 이 0.70 이었다. 같은 영상에서 눈에 띄게
+# 어긋난 자동 보정이 0.63 이었다. 둘 사이가 0.07 밖에 안 된다.
+# 즉 이 점수로는 '맞다' 를 증명할 수 없다. 낮으면 틀렸다는 것만 말할 수 있다.
+# 그래서 확실히 좋은 경우가 아니면 기여도 계산으로 넘어가지 않고 멈춘다.
+# 사람이 calib_check.png 를 보고 판단하는 편이 훨씬 정확하다.
 MOVE_WARN = 8.0        # 장면마다 보정이 이만큼(m) 넘게 다르면 카메라가 움직인다
 
 

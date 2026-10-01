@@ -64,6 +64,7 @@ DEFAULTS = {
     "pitch_l": 105.0, "pitch_w": 68.0, "team_size": 0,     # 0 = 자동
     "from_sec": "", "to_sec": "", "save_video": False,
     "speed": "auto", "stitch": True,
+    "force_calib": False, "reuse_tracks": True,
     "norm": "z", "exclude_gk": True, "pos_adjust": True, "pa_learn": True,
     "spec_pv_prox": False, "spec_prog_goaldist": False,
     "manual_src": None, "manual_dst": None,                # 손으로 보정했을 때만
@@ -324,6 +325,18 @@ class App:
         ttk.Checkbutton(a15, text="끊어진 ID 잇기", variable=self.stitch_var
                         ).pack(side="right")
 
+        a16 = ttk.Frame(self.adv)
+        a16.pack(fill="x", pady=2)
+        self.force_var = tk.BooleanVar(value=self.cfg.get("force_calib", False))
+        self.reuse_var = tk.BooleanVar(value=self.cfg.get("reuse_tracks", True))
+        ttk.Checkbutton(a16, text="보정이 의심스러워도 계산",
+                        variable=self.force_var).pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(a16, text="좌표 다시 뽑기 (이미 있어도)",
+                        variable=self.reuse_var, onvalue=False, offvalue=True
+                        ).pack(side="left", padx=(0, 12))
+        ttk.Label(a16, text="보정이 미덥지 않으면 기본적으로 기여도를 내지 않고 멈춥니다",
+                  style="Muted.TLabel").pack(side="left")
+
         a2 = ttk.Frame(self.adv)
         a2.pack(fill="x", pady=2)
         self.vid_var = tk.BooleanVar(value=self.cfg["save_video"])
@@ -496,6 +509,8 @@ class App:
             "spec_pv_prox": self.sw1_var.get(), "spec_prog_goaldist": self.sw2_var.get(),
             "speed": SPEED_KEY.get(self.speed_var.get(), "auto"),
             "stitch": self.stitch_var.get(),
+            "force_calib": self.force_var.get(),
+            "reuse_tracks": self.reuse_var.get(),
         })
         save_config(self.cfg)
         return self.cfg
@@ -531,7 +546,8 @@ class App:
             try:
                 self.q.put(("log", f"\n[{item.name}]", "head"))
                 if pipeline.is_video(item):
-                    csv_path = self._track(item, cfg, out_root)
+                    csv_path = self._reuse(item, cfg, out_root) or \
+                        self._track(item, cfg, out_root)
                     self.last_video = item
                     if csv_path is None:
                         self.last_result = None
@@ -547,6 +563,8 @@ class App:
                     break
                 self._calib_png = out_dir / "calib_check.png"
                 H, calib_note = self._calibrate(video, csv_path, cfg)
+                if H is not None and not self._calib_ok(cfg, out_dir):
+                    continue
                 csv_path = self._stitch(csv_path, cfg, H)
                 if self._analyze(csv_path, cfg, out_dir, H, calib_note):
                     done += 1
@@ -555,6 +573,35 @@ class App:
                 for line in traceback.format_exc().splitlines()[-6:]:
                     self.q.put(("log", "    " + line))
         self.q.put(("done", done, len(items)))
+
+    def _reuse(self, video: Path, cfg, out_root: Path):
+        """
+        이미 뽑아 둔 좌표가 있으면 그걸 쓴다.
+
+        영상 분석은 이 프로그램에서 제일 오래 걸리는 단계다(실측 27분).
+        그런데 보정을 손으로 다시 잡아 보는 일은 자주 생긴다. 그때마다
+        선수를 처음부터 다시 찾는 것은 낭비다. 같은 영상·같은 설정이면
+        좌표는 똑같이 나오므로 그대로 쓴다.
+        """
+        if not cfg.get("reuse_tracks", True):
+            return None
+        out_dir = out_root / video.stem
+        csv_path = out_dir / "tracks.csv"
+        if not csv_path.is_file() or csv_path.stat().st_size < 1000:
+            return None
+        # 구간을 지정했으면 폴더 이름이 달라지므로 재사용하지 않는다
+        if cfg.get("from_sec") or cfg.get("to_sec"):
+            return None
+        self.q.put(("log", "  1 / 3  이미 뽑아 둔 좌표를 씁니다 (영상 분석 건너뜀)", "head"))
+        self.q.put(("log", f"    {csv_path}"))
+        self.q.put(("log", "    처음부터 다시 하려면 [고급 설정] 의 "
+                           "'좌표 다시 뽑기' 를 켜세요."))
+        summary = pipeline.read_summary(csv_path)
+        size = int(cfg["team_size"]) or 11
+        if summary:
+            for grade, line in pipeline.check_tracking(summary, size):
+                self.q.put(("log", "  " + line, grade if grade == "warn" else "ok"))
+        return csv_path
 
     # ------------------------------------------------------- 1단계 · 추적
     def _track(self, video: Path, cfg, out_root: Path):
@@ -597,6 +644,7 @@ class App:
         if cfg.get("manual_src") and cfg.get("manual_dst"):
             H = autocalib.homography(cfg["manual_src"], cfg["manual_dst"])
             self.q.put(("log", "  2 / 3  경기장 보정 — 손으로 지정한 기준점을 씁니다", "head"))
+            self._calib_score = 1.0        # 사람이 찍은 점은 검산 대상이 아니다
             return H, "손으로 지정"
         if video is None:
             return None, "없음 (좌표 파일은 이미 미터로 봅니다)"
@@ -635,7 +683,48 @@ class App:
                 self.q.put(("log", f"  보정 확인 그림: {Path(shot).name}", "ok"))
         except Exception as exc:                              # noqa: BLE001
             self.q.put(("log", f"  확인 그림을 못 만들었습니다 ({type(exc).__name__})"))
+        self._calib_score = float(score)
         return H, f"{how} (선 모양 검산 {score:.2f})"
+
+    def _calib_ok(self, cfg, out_dir: Path) -> bool:
+        """
+        보정이 미덥지 않으면 기여도 계산으로 넘어가지 않는다.
+
+        왜 그냥 계산해 주지 않나 — 보정이 틀리면 기여도 숫자는 '덜 정확한
+        값' 이 아니라 '아무 값' 이다. 모든 상수가 미터 기준이라, 미터가
+        틀리면 압박 거리도 위험도 가중치도 공간 통제도 전부 다른 것을
+        재게 된다. 그런데 결과표는 똑같이 그럴듯하게 생겼다. 실측에서
+        네 번 연속 그런 표가 나왔고, 그게 틀렸다는 걸 알 방법이 없었다.
+
+        점수로 '맞다' 를 증명할 수 없다는 것도 확인했다 (autocalib.TPL_TRUST
+        의 설명 참고). 그래서 확실히 좋은 경우가 아니면 사람에게 넘긴다.
+        """
+        score = float(getattr(self, "_calib_score", 0.0))
+        if cfg.get("force_calib") or score >= autocalib.TPL_TRUST:
+            return True
+        png = out_dir / "calib_check.png"
+        self.q.put(("log", "", None))
+        self.q.put(("log", "  여기서 멈춥니다 — 경기장 보정을 믿을 수 없습니다.", "warn"))
+        self.q.put(("log", f"    선 모양 검산 {score:.2f} (믿고 쓰려면 "
+                           f"{autocalib.TPL_TRUST:.2f} 이상이어야 합니다)"))
+        self.q.put(("log", "    보정이 틀리면 기여도는 '덜 정확한 값' 이 아니라 "
+                           "아무 값입니다. 모든 상수가 미터 기준이라서,"))
+        self.q.put(("log", "    미터가 틀리면 압박 거리도 위험도도 공간 통제도 "
+                           "전부 다른 것을 재게 됩니다. 그런데 결과표는"))
+        self.q.put(("log", "    똑같이 그럴듯하게 생겨서 틀린 줄 모릅니다. "
+                           "그래서 숫자를 내지 않습니다.", "warn"))
+        self.q.put(("log", ""))
+        self.q.put(("log", "  이렇게 하세요", "head"))
+        if png.is_file():
+            self.q.put(("log", f"    1. {png.name} 를 열어 보세요 "
+                               f"([결과 폴더 열기] 버튼)"))
+        self.q.put(("log", "    2. 빨간 선이 흰 선 위에 얹혀 있으면 "
+                           "[고급 설정] 의 '보정이 의심스러워도 계산' 을 켜고 다시"))
+        self.q.put(("log", "    3. 어긋나 있으면 [고급 설정] 의 "
+                           "[손으로 보정하기] 로 네 점을 찍으세요"))
+        self.q.put(("log", "       (좌표는 이미 뽑아 뒀으니 다시 돌려도 "
+                           "영상 분석은 건너뜁니다 — 1분이면 끝납니다)", "ok"))
+        return False
 
     # ------------------------------------------------ 2.5단계 · ID 손질
     def _stitch(self, csv_path: Path, cfg, H):
