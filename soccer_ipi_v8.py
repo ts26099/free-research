@@ -1091,11 +1091,32 @@ def ball_plausibility(ball):
         bad |= (v > BALL_SPEED_MAX).fillna(False)
 
     if BALL_FROZEN_M > 0 and BALL_FROZEN_S > 0:
-        # '거의 안 움직인' 구간을 이어 붙여 길이를 잰다
-        still = (step <= BALL_FROZEN_M).fillna(False)
-        grp = (~still).cumsum()
-        span = b.frame.groupby(grp).transform(lambda f: f.max() - f.min())
-        bad |= still & (span >= BALL_FROZEN_S * FPS)
+        # 얼어붙었는지는 '창' 으로 봐야 한다. 한 프레임 이동량과 비교하면 안 된다.
+        #
+        # 예전에는 step <= BALL_FROZEN_M(0.3 m) 인 프레임을 '멈춤' 으로 보고
+        # 그 구간이 2초 넘게 이어지면 버렸다. 그런데 한 프레임 이동량은
+        # 속도 ÷ fps 다. 25 fps 면 7.5 m/s, 15 fps 면 4.5 m/s 보다 느린 공이
+        # 전부 '멈춤' 으로 찍힌다 — 축구공의 보통 속도가 4~8 m/s 이므로
+        # 정상적인 플레이가 통째로 버려진다. 모사 경기에서 1,200 프레임 중
+        # 999 프레임(83%)이 이 조건으로 날아갔다.
+        #
+        # 제대로 된 질문은 "이 공이 2초 동안 0.3 m 안에 머물렀나" 다.
+        # 그래서 BALL_FROZEN_S 초짜리 창 안에서 공이 돌아다닌 범위를 재고,
+        # 그 범위가 BALL_FROZEN_M 보다 작을 때만 얼어붙은 것으로 본다.
+        n = max(2, int(round(BALL_FROZEN_S * FPS)))
+        # 빠진 프레임이 있어도 시간 간격이 맞도록 프레임 번호로 다시 깐다
+        g = (b.set_index("frame")[["ball_x", "ball_y"]]
+               .reindex(range(int(b.frame.min()), int(b.frame.max()) + 1)))
+        # 창의 절반만 차도 판정한다. 가운데 맞춘 창을 꽉 채우도록 하면
+        # 영상 처음·끝 1초는 아예 판정이 안 되어, 거기 있는 고정 오검출을
+        # 놓친다. 절반(=1초)이면 '2초 동안 0.3 m' 의 뜻은 유지된다.
+        half = max(2, n // 2)
+        rng_x = g.ball_x.rolling(n, center=True, min_periods=half).max() - \
+            g.ball_x.rolling(n, center=True, min_periods=half).min()
+        rng_y = g.ball_y.rolling(n, center=True, min_periods=half).max() - \
+            g.ball_y.rolling(n, center=True, min_periods=half).min()
+        frozen = (np.hypot(rng_x, rng_y) <= BALL_FROZEN_M)
+        bad |= b.frame.map(frozen).fillna(False).to_numpy()
 
     b["ball_bad"] = bad
     return b
@@ -2272,6 +2293,20 @@ def main():
     if len(SCdf):
         chk = SCdf.groupby("frame").agg(s=("SC", "sum"), t=("sc_team_total", "first"))
         print(f"  검산    효율성 공리 최대오차 {np.abs(chk.s - chk.t).max():.1e}")
+
+    # 비어 있는 표에도 열은 있어야 한다. 공 소유자를 한 번도 못 정하면
+    # PR 과 PA 가 둘 다 0행이 되는데, 그때 빈 표에 'frame' 열이 없어서
+    # 아래 merge 가 KeyError 로 죽었다. 값이 없는 것과 열이 없는 것은 다르다.
+    pr_cols = ["frame", "track_id", "team", "PR", "PD", "PV", "d"]
+    for c in pr_cols:
+        if c not in PRdf.columns:
+            PRdf[c] = pd.Series(dtype="float64" if c not in
+                                ("frame", "track_id", "team") else "object")
+    if not len(PRdf) and not len(PAdf):
+        raise SystemExit(
+            "PR 도 PA 도 한 행이 없다 — 공 소유자를 한 번도 정하지 못했다는 뜻이다.\n"
+            "  공 좌표가 없거나, 공이 선수들로부터 늘 POSS_RADIUS 밖에 있다.\n"
+            "  [읽기] 단계의 '공-최근접선수 거리' 와 '공소유 usable' 을 확인할 것.")
 
     M = PRdf.merge(SCdf[["frame", "track_id", "SC", "SC_share"]],
                    on=["frame", "track_id"], how="left") \

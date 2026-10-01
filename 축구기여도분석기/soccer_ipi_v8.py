@@ -63,8 +63,6 @@ SHEET_BALL   = None      # 공 좌표가 따로 있는 시트. 없으면 None (�
 #     HOMOGRAPHY_DST = [(0, 0), (105, 0), (105, 68), (0, 68)]
 HOMOGRAPHY_SRC = None    # None 이면 변환하지 않는다 (이미 미터 좌표인 입력)
 HOMOGRAPHY_DST = None
-HOMOGRAPHY_H = None      # 3x3 행렬을 직접 줄 수도 있다 (자동 보정이 이쪽으로 준다).
-                         #   기준점 네 쌍 대신 이미 구한 변환을 그대로 쓴다.
 PLAYER_POINT = "foot"    # 선수 대표점 (수식 9). "foot" = 발밑 중앙 (fx,fy)
                          #   "center" = 박스 중심. 호모그래피는 지면 평면 변환이라
                          #   공중에 뜬 점(배꼽)을 넣으면 좌표가 뒤로 밀린다.
@@ -666,10 +664,7 @@ def read_data():
     #  문서 §7 한계 1 이 "호모그래피를 아직 안 썼다"이고 §8 할 일 1순위가 이것이다.
     #  카메라가 비스듬히 찍으면 화면 어디냐에 따라 거리 오차가 14~46% 난다.
     #  SC 와 PR 이 둘 다 거리 기반이라 그 오차가 지표 전체로 번진다.
-    H = None
-    if HOMOGRAPHY_H is not None:
-        H = np.asarray(HOMOGRAPHY_H, float).reshape(3, 3)
-    elif HOMOGRAPHY_SRC and HOMOGRAPHY_DST:
+    if HOMOGRAPHY_SRC and HOMOGRAPHY_DST:
         H = solve_homography(HOMOGRAPHY_SRC, HOMOGRAPHY_DST)
         # 되돌림 오차 — 기준점을 변환해 실제 위치와 비교한다. 네 점이 한 직선에
         # 가깝게 몰려 있으면 식은 풀려도 엉뚱한 변환이 나오는데 여기서 드러난다.
@@ -682,7 +677,6 @@ def read_data():
         if _e > 1.0:
             print(f"  ! 기준점이 잘 안 맞는다. 네 점이 한 직선에 가깝거나 클릭 위치가 "
                   f"실제 지점과 다를 수 있다. 보정을 다시 하는 편이 낫다.")
-    if H is not None:
         bx0, by0 = tracks["X"].median(), tracks["Y"].median()
         tracks["X"], tracks["Y"] = apply_homography(H, tracks["X"], tracks["Y"])
         if {"ball_x", "ball_y"} <= set(tracks.columns):   # 공이 별도 열로 온 경우
@@ -1097,22 +1091,32 @@ def ball_plausibility(ball):
         bad |= (v > BALL_SPEED_MAX).fillna(False)
 
     if BALL_FROZEN_M > 0 and BALL_FROZEN_S > 0:
-        # 얼어붙었는지는 '한 프레임 사이에 얼마나 움직였나'로 보면 안 된다.
-        #   25 fps 에서 2 m/s 로 굴러가는 공은 한 프레임에 0.08 m 만 움직인다.
-        #   그걸 '거의 안 움직였다'로 세면 드리블이 2초만 이어져도 공 전체가
-        #   가짜로 찍힌다(실측: 600프레임 중 599프레임이 버려졌다).
-        #   그래서 '그 시간 창 안에서 얼마나 옮겨 갔나'를 본다.
-        win = max(2, int(round(BALL_FROZEN_S * FPS)))
-        full = pd.RangeIndex(int(b.frame.min()), int(b.frame.max()) + 1)
-        gx = b.set_index("frame")["ball_x"].reindex(full).interpolate(limit_area="inside")
-        gy = b.set_index("frame")["ball_y"].reindex(full).interpolate(limit_area="inside")
-        # 창을 가운데에 두고 본다. 뒤로만 보면 '멈춘 지 2초가 지난 뒤부터' 걸려서
-        # 멈춰 있던 앞부분이 그대로 남는다.
-        roll = dict(window=win, center=True, min_periods=max(2, win // 2))
-        rng = ((gx.rolling(**roll).max() - gx.rolling(**roll).min())
-               .combine((gy.rolling(**roll).max() - gy.rolling(**roll).min()), max))
-        frozen = (rng <= BALL_FROZEN_M).reindex(b.frame).fillna(False).to_numpy()
-        bad |= pd.Series(frozen, index=b.index)
+        # 얼어붙었는지는 '창' 으로 봐야 한다. 한 프레임 이동량과 비교하면 안 된다.
+        #
+        # 예전에는 step <= BALL_FROZEN_M(0.3 m) 인 프레임을 '멈춤' 으로 보고
+        # 그 구간이 2초 넘게 이어지면 버렸다. 그런데 한 프레임 이동량은
+        # 속도 ÷ fps 다. 25 fps 면 7.5 m/s, 15 fps 면 4.5 m/s 보다 느린 공이
+        # 전부 '멈춤' 으로 찍힌다 — 축구공의 보통 속도가 4~8 m/s 이므로
+        # 정상적인 플레이가 통째로 버려진다. 모사 경기에서 1,200 프레임 중
+        # 999 프레임(83%)이 이 조건으로 날아갔다.
+        #
+        # 제대로 된 질문은 "이 공이 2초 동안 0.3 m 안에 머물렀나" 다.
+        # 그래서 BALL_FROZEN_S 초짜리 창 안에서 공이 돌아다닌 범위를 재고,
+        # 그 범위가 BALL_FROZEN_M 보다 작을 때만 얼어붙은 것으로 본다.
+        n = max(2, int(round(BALL_FROZEN_S * FPS)))
+        # 빠진 프레임이 있어도 시간 간격이 맞도록 프레임 번호로 다시 깐다
+        g = (b.set_index("frame")[["ball_x", "ball_y"]]
+               .reindex(range(int(b.frame.min()), int(b.frame.max()) + 1)))
+        # 창의 절반만 차도 판정한다. 가운데 맞춘 창을 꽉 채우도록 하면
+        # 영상 처음·끝 1초는 아예 판정이 안 되어, 거기 있는 고정 오검출을
+        # 놓친다. 절반(=1초)이면 '2초 동안 0.3 m' 의 뜻은 유지된다.
+        half = max(2, n // 2)
+        rng_x = g.ball_x.rolling(n, center=True, min_periods=half).max() - \
+            g.ball_x.rolling(n, center=True, min_periods=half).min()
+        rng_y = g.ball_y.rolling(n, center=True, min_periods=half).max() - \
+            g.ball_y.rolling(n, center=True, min_periods=half).min()
+        frozen = (np.hypot(rng_x, rng_y) <= BALL_FROZEN_M)
+        bad |= b.frame.map(frozen).fillna(False).to_numpy()
 
     b["ball_bad"] = bad
     return b
@@ -2289,6 +2293,20 @@ def main():
     if len(SCdf):
         chk = SCdf.groupby("frame").agg(s=("SC", "sum"), t=("sc_team_total", "first"))
         print(f"  검산    효율성 공리 최대오차 {np.abs(chk.s - chk.t).max():.1e}")
+
+    # 비어 있는 표에도 열은 있어야 한다. 공 소유자를 한 번도 못 정하면
+    # PR 과 PA 가 둘 다 0행이 되는데, 그때 빈 표에 'frame' 열이 없어서
+    # 아래 merge 가 KeyError 로 죽었다. 값이 없는 것과 열이 없는 것은 다르다.
+    pr_cols = ["frame", "track_id", "team", "PR", "PD", "PV", "d"]
+    for c in pr_cols:
+        if c not in PRdf.columns:
+            PRdf[c] = pd.Series(dtype="float64" if c not in
+                                ("frame", "track_id", "team") else "object")
+    if not len(PRdf) and not len(PAdf):
+        raise SystemExit(
+            "PR 도 PA 도 한 행이 없다 — 공 소유자를 한 번도 정하지 못했다는 뜻이다.\n"
+            "  공 좌표가 없거나, 공이 선수들로부터 늘 POSS_RADIUS 밖에 있다.\n"
+            "  [읽기] 단계의 '공-최근접선수 거리' 와 '공소유 usable' 을 확인할 것.")
 
     M = PRdf.merge(SCdf[["frame", "track_id", "SC", "SC_share"]],
                    on=["frame", "track_id"], how="left") \
