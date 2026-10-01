@@ -119,6 +119,8 @@ class CalibrateWindow(tk.Toplevel):
         self.marks: list[dict] = []          # {px, py, name, mx, my, canvas ids}
         self.scale = 1.0
         self.photo = None
+        self.raw = None
+        self.check_photo = None
         self.tmp_png = None
         self.names = [n for n, _, _ in landmarks(pitch_l, pitch_w)]
         self.lut = {n: (x, y) for n, x, y in landmarks(pitch_l, pitch_w)}
@@ -223,6 +225,7 @@ class CalibrateWindow(tk.Toplevel):
         self.scale = min(self.MAX_W / w, self.MAX_H / h, 1.0)
         show = cv2.resize(img, (max(1, int(w * self.scale)), max(1, int(h * self.scale))),
                           interpolation=cv2.INTER_AREA)
+        self.raw = img                      # 확인 그림에 쓸 원본 화면
         fd, self.tmp_png = tempfile.mkstemp(suffix=".png")
         os.close(fd)
         cv2.imwrite(self.tmp_png, show)
@@ -307,6 +310,75 @@ class CalibrateWindow(tk.Toplevel):
             text=f"{n}개" + ("" if n >= 4 else f" (4개 이상 필요 — {4 - n}개 더)"))
         self.apply_btn.configure(state="normal" if n >= 4 else "disabled")
 
+    def confirm_overlay(self, src, dst) -> bool:
+        """
+        찍은 점으로 구한 변환이 맞는지 눈으로 보여 주고 확인받는다.
+
+        되돌림 오차만으로는 부족하다. 네 점 자신은 잘 맞아도 경기장 전체가
+        어긋나 있을 수 있다 (점 네 개는 그 네 점만 보장한다). 실제 경기장
+        선을 화면에 되돌려 그려서 흰 선 위에 얹히는지 보면 바로 안다.
+        """
+        if self.raw is None:
+            return True
+        try:
+            import cv2                      # 이 파일은 cv2 를 쓰는 곳에서만 불러온다
+            import numpy as np
+            import autocalib
+        except ImportError:
+            return True
+        H = autocalib.homography(src, dst)
+        if H is None:
+            return True
+        img = self.raw.copy()
+        tpl = autocalib.pitch_lines(self.pitch_l, self.pitch_w)
+        try:
+            q = np.linalg.inv(np.asarray(H, float)) @ np.stack(
+                [tpl[:, 0], tpl[:, 1], np.ones(len(tpl))])
+        except np.linalg.LinAlgError:
+            return True
+        ok = np.abs(q[2]) > 1e-9
+        x, y = q[0][ok] / q[2][ok], q[1][ok] / q[2][ok]
+        h, w = img.shape[:2]
+        for xx, yy in zip(x, y):
+            if -20 < xx < w + 20 and -20 < yy < h + 20:
+                cv2.circle(img, (int(xx), int(yy)), 2, (0, 255, 0), -1)
+        for px, py in src:
+            cv2.circle(img, (int(px), int(py)), 12, (0, 255, 255), 3)
+        sc = min(self.MAX_W / w, self.MAX_H / h, 1.0)
+        show = cv2.resize(img, (max(1, int(w * sc)), max(1, int(h * sc))),
+                          interpolation=cv2.INTER_AREA)
+        fd, png = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        cv2.imwrite(png, show)
+
+        win = tk.Toplevel(self)
+        win.title("이렇게 보입니다 — 초록 선이 흰 선 위에 얹혀 있습니까?")
+        win.transient(self)
+        self.check_photo = tk.PhotoImage(file=png)
+        tk.Label(win, image=self.check_photo).pack()
+        tk.Label(win, text="초록 = 찍은 점으로 구한 경기장 선 · 노랑 = 찍은 점\n"
+                           "초록이 화면의 흰 선 위에 얹혀 있어야 맞는 보정입니다.",
+                 justify="left").pack(padx=10, pady=(6, 0))
+        res = {"go": False}
+
+        def yes():
+            res["go"] = True
+            win.destroy()
+
+        row = tk.Frame(win)
+        row.pack(pady=8)
+        tk.Button(row, text="맞습니다 — 이걸로 쓰겠습니다", width=26,
+                  command=yes).pack(side="left", padx=6)
+        tk.Button(row, text="아니요 — 다시 찍겠습니다", width=22,
+                  command=win.destroy).pack(side="left", padx=6)
+        win.grab_set()
+        self.wait_window(win)
+        try:
+            os.unlink(png)
+        except OSError:
+            pass
+        return res["go"]
+
     def apply(self):
         src = [(m["px"], m["py"]) for m in self.marks]
         dst = [(m["mx"], m["my"]) for m in self.marks]
@@ -331,6 +403,8 @@ class CalibrateWindow(tk.Toplevel):
                 "그래도 이대로 쓸까요?", parent=self)
             if not go:
                 return
+        if not self.confirm_overlay(src, dst):
+            return
         if self.on_done:
             self.on_done(src, dst)
         if self.tmp_png and os.path.exists(self.tmp_png):
